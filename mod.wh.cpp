@@ -887,6 +887,8 @@ constexpr UINT kAppBarMsg = WM_APP + 42;
 constexpr WCHAR kClassName[] = L"MinimalistTopBar";
 constexpr WCHAR kRadioKey[] = L"SYSTEM\\CurrentControlSet\\Control\\RadioManagement";
 constexpr UINT kRadioMsg = WM_APP + 43;
+constexpr GUID kPowerSavingGuid = {
+    0xE00958C0, 0xC213, 0x4ACE, {0xAC, 0x77, 0xFE, 0xCC, 0xED, 0x2E, 0xEE, 0xA5}};
 constexpr BYTE kVignettePeak = 64;
 enum Edge { kEdgeBottom, kEdgeLeft, kEdgeRight, kEdgeTop };
 HDC g_vignetteDC = nullptr;
@@ -1133,6 +1135,7 @@ struct PaintKey {
     int acLine = -1;
     bool airplane = false;
     bool bluetooth = false;
+    bool saver = false;
 };
 
 PaintKey CurrentPaintKey() {
@@ -1144,13 +1147,16 @@ PaintKey CurrentPaintKey() {
     if (GetSystemPowerStatus(&ps)) {
         key.batteryPercent = ps.BatteryLifePercent;
         key.acLine = ps.ACLineStatus;
+        key.saver = ps.BatteryFlag != 128 && ps.BatteryLifePercent <= 100 &&
+                    (ps.SystemStatusFlag & 1);
     }
     return key;
 }
 
 bool SamePaintKey(PaintKey const& a, PaintKey const& b) {
     return a.date == b.date && a.time == b.time && a.batteryPercent == b.batteryPercent &&
-           a.acLine == b.acLine && a.airplane == b.airplane && a.bluetooth == b.bluetooth;
+           a.acLine == b.acLine && a.airplane == b.airplane && a.bluetooth == b.bluetooth &&
+           a.saver == b.saver;
 }
 
 PaintKey g_paintKey;
@@ -1532,10 +1538,10 @@ void Paint(HWND hwnd) {
         bool charging = hasBattery && ps.ACLineStatus == 1;
         bool saver = hasBattery && (ps.SystemStatusFlag & 1);
         Gdiplus::Color batteryColor(255, 255, 255, 255);
-        if (saver)
-            batteryColor = Gdiplus::Color(255, 255, 214, 10);
-        else if (level < 20)
+        if (level <= 20)
             batteryColor = Gdiplus::Color(255, 255, 69, 58);
+        else if (saver)
+            batteryColor = Gdiplus::Color(255, 255, 214, 10);
         else if (charging)
             batteryColor = Gdiplus::Color(255, 52, 199, 89);
 
@@ -1834,6 +1840,8 @@ DWORD WINAPI ThreadProc(void*) {
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, L"STATIC",
             nullptr, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
         g_wnd = hwnd;
+        HPOWERNOTIFY powerNotify =
+            RegisterPowerSettingNotification(hwnd, &kPowerSavingGuid, DEVICE_NOTIFY_WINDOW_HANDLE);
         APPBARDATA abd{sizeof(abd)};
         abd.hWnd = hwnd;
         abd.uCallbackMessage = kAppBarMsg;
@@ -1856,6 +1864,8 @@ DWORD WINAPI ThreadProc(void*) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
+        if (powerNotify)
+            UnregisterPowerSettingNotification(powerNotify);
     }
 
     if (g_vignette) {
