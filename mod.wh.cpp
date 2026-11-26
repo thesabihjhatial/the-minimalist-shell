@@ -888,6 +888,12 @@ constexpr WCHAR kClassName[] = L"MinimalistTopBar";
 constexpr WCHAR kRadioKey[] = L"SYSTEM\\CurrentControlSet\\Control\\RadioManagement";
 constexpr UINT kRadioMsg = WM_APP + 43;
 constexpr BYTE kVignettePeak = 64;
+enum Edge { kEdgeBottom, kEdgeLeft, kEdgeRight, kEdgeTop };
+HDC g_vignetteDC = nullptr;
+HBITMAP g_vignetteBitmap = nullptr;
+Edge g_vignetteEdge = kEdgeBottom;
+HGDIOBJ g_vignetteOld = nullptr;
+RECT g_vignetteRect{};
 HWND g_vignette = nullptr;
 
 namespace Radios = winrt::Windows::Devices::Radios;
@@ -1151,7 +1157,7 @@ PaintKey g_paintKey;
 bool g_paintKeyValid = false;
 
 void Paint(HWND hwnd);
-void PresentLayered(HWND hwnd);
+void PresentLayered(HWND hwnd, bool alphaOnly = false);
 
 std::unique_ptr<Gdiplus::Font> g_clockFont;
 float g_clockFontSize = 0.0f;
@@ -1297,46 +1303,104 @@ bool EnsureSurface(int w, int h) {
     return true;
 }
 
-void PresentVignette() {
+void ReleaseVignette() {
+    if (g_vignetteDC) {
+        if (g_vignetteOld)
+            SelectObject(g_vignetteDC, g_vignetteOld);
+        DeleteDC(g_vignetteDC);
+    }
+    if (g_vignetteBitmap)
+        DeleteObject(g_vignetteBitmap);
+    g_vignetteDC = nullptr;
+    g_vignetteBitmap = nullptr;
+    g_vignetteOld = nullptr;
+    g_vignetteRect = {};
+}
+
+bool VignetteSuppressed(HWND tray) {
+    if (g_fullscreen || !tray || !IsWindowVisible(tray))
+        return true;
+    APPBARDATA abd{sizeof(abd)};
+    if (SHAppBarMessage(ABM_GETSTATE, &abd) & ABS_AUTOHIDE)
+        return true;
+    QUERY_USER_NOTIFICATION_STATE state;
+    return SUCCEEDED(SHQueryUserNotificationState(&state)) &&
+           (state == QUNS_BUSY || state == QUNS_RUNNING_D3D_FULL_SCREEN ||
+            state == QUNS_PRESENTATION_MODE);
+}
+
+Edge VignetteEdge(RECT const& r) {
+    RECT mon = PrimaryMonitorRect();
+    if (r.right - r.left >= r.bottom - r.top)
+        return r.top + r.bottom < mon.top + mon.bottom ? kEdgeTop : kEdgeBottom;
+    return r.left + r.right < mon.left + mon.right ? kEdgeLeft : kEdgeRight;
+}
+
+void FillVignette(DWORD* bits, int w, int h, Edge edge) {
+    auto shade = [](int i, int n) { return (DWORD)(kVignettePeak * (i + 1) / n) << 24; };
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            DWORD px = edge == kEdgeBottom ? shade(y, h)
+                       : edge == kEdgeTop  ? shade(h - 1 - y, h)
+                       : edge == kEdgeRight ? shade(x, w)
+                                            : shade(w - 1 - x, w);
+            bits[(size_t)y * w + x] = px;
+        }
+    }
+}
+
+void PresentVignette(bool alphaOnly = false) {
     if (!g_vignette || !g_screenDC)
         return;
-    HWND tray = FindWindow(L"Shell_TrayWnd", nullptr);
-    RECT r;
-    int w = 0, h = 0;
-    if (!g_fullscreen && tray && GetWindowRect(tray, &r)) {
-        w = r.right - r.left;
-        h = r.bottom - r.top;
+    BYTE alpha = (BYTE)std::lround(std::clamp(g_winAlpha, 0.0, 1.0) * 255.0);
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+    POINT src{0, 0};
+
+    auto update = [&](RECT const& r) {
+        POINT dst{r.left, r.top};
+        SIZE size{r.right - r.left, r.bottom - r.top};
+        UpdateLayeredWindow(g_vignette, g_screenDC, &dst, &size, g_vignetteDC, &src, 0, &blend,
+                            ULW_ALPHA);
+    };
+
+    if (alphaOnly && g_vignetteBitmap && IsWindowVisible(g_vignette)) {
+        update(g_vignetteRect);
+        return;
     }
-    if (w <= 0 || h <= 0) {
+
+    HWND tray = FindWindow(L"Shell_TrayWnd", nullptr);
+    RECT r{};
+    if (VignetteSuppressed(tray) || !GetWindowRect(tray, &r) || r.right <= r.left ||
+        r.bottom <= r.top) {
         ShowWindow(g_vignette, SW_HIDE);
         return;
     }
 
-    HDC dc = CreateCompatibleDC(g_screenDC);
-    void* bits = nullptr;
-    HBITMAP bitmap = dc ? CreateDib(dc, w, h, &bits) : nullptr;
-    if (bitmap && bits) {
-        HGDIOBJ old = SelectObject(dc, bitmap);
-        for (int y = 0; y < h; y++)
-            std::fill_n((DWORD*)bits + (size_t)y * w, w, (DWORD)(kVignettePeak * (y + 1) / h) << 24);
-        SetWindowPos(g_vignette, tray, r.left, r.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        POINT dst{r.left, r.top};
-        SIZE size{w, h};
-        POINT src{0, 0};
-        BYTE alpha = (BYTE)std::lround(std::clamp(g_winAlpha, 0.0, 1.0) * 255.0);
-        BLENDFUNCTION blend{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
-        UpdateLayeredWindow(g_vignette, g_screenDC, &dst, &size, dc, &src, 0, &blend,
-                            ULW_ALPHA);
-        SelectObject(dc, old);
+    Edge edge = VignetteEdge(r);
+    if (!g_vignetteBitmap || !EqualRect(&r, &g_vignetteRect) || edge != g_vignetteEdge) {
+        ReleaseVignette();
+        void* bits = nullptr;
+        g_vignetteDC = CreateCompatibleDC(g_screenDC);
+        if (g_vignetteDC)
+            g_vignetteBitmap = CreateDib(g_vignetteDC, r.right - r.left, r.bottom - r.top, &bits);
+        if (!g_vignetteBitmap || !bits) {
+            ReleaseVignette();
+            ShowWindow(g_vignette, SW_HIDE);
+            return;
+        }
+        g_vignetteOld = SelectObject(g_vignetteDC, g_vignetteBitmap);
+        FillVignette((DWORD*)bits, r.right - r.left, r.bottom - r.top, edge);
+        g_vignetteRect = r;
+        g_vignetteEdge = edge;
     }
-    if (bitmap)
-        DeleteObject(bitmap);
-    if (dc)
-        DeleteDC(dc);
+
+    SetWindowPos(g_vignette, tray, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    update(r);
 }
 
-void PresentLayered(HWND hwnd) {
-    PresentVignette();
+void PresentLayered(HWND hwnd, bool alphaOnly) {
+    PresentVignette(alphaOnly);
     if (!hwnd || !g_surfaceDC || g_surfaceW <= 0 || g_surfaceH <= 0)
         return;
     RECT wr{};
@@ -1625,7 +1689,7 @@ void BarMotionTick() {
     bool moved = alpha != g_winAlpha;
     g_winAlpha = alpha;
     if (moved && hwnd)
-        PresentLayered(hwnd);
+        PresentLayered(hwnd, true);
 
     if (!moved) {
         StopBarMotion();
@@ -1798,6 +1862,7 @@ DWORD WINAPI ThreadProc(void*) {
         DestroyWindow(g_vignette);
         g_vignette = nullptr;
     }
+    ReleaseVignette();
     g_wnd = nullptr;
     g_items.clear();
     StopRadioWorker();
@@ -2493,12 +2558,13 @@ bool Launch(HWND hwnd, bool rising) {
     }
 
     bool wait = shown && job->firstFrame;
-    if (!Spawn(job.get())) {
+    Job* raw = job.release();
+    if (!Spawn(raw)) {
+        delete raw;
         if (shown)
             CloseHandle(shown);
         return false;
     }
-    job.release();
     if (shown) {
         if (wait)
             WaitForSingleObject(shown, kFirstFrameWaitMs);
