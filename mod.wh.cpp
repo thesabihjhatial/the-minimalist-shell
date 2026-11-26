@@ -1,12 +1,12 @@
 // ==WindhawkMod==
 // @id              the-minimalist-shell
 // @name            The Minimalist Shell
-// @description     Turns the Windows 11 shell into a minimalistic MacOS style shell
+// @description     Turns the Windows 11 shell into a minimalistic MacOS style shell with genie minimize and restore
 // @version         1.0
 // @author          Muhammad Sabih
-// @include         explorer.exe
+// @include         *
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lgdi32 -luser32 -lgdiplus -lshell32 -ladvapi32 -ldwmapi
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lgdi32 -luser32 -lgdiplus -lshell32 -ladvapi32 -ldwmapi -luuid
 // ==/WindhawkMod==
 
 #ifndef NOMINMAX
@@ -18,34 +18,45 @@
 #include <dwmapi.h>
 #include <gdiplus.h>
 #include <shellapi.h>
+#include <uiautomation.h>
 #include <windowsx.h>
 
 #include <algorithm>
 #include <atomic>
-#include <initializer_list>
-#include <utility>
 #include <chrono>
 #include <cmath>
 #include <cwctype>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
-#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
-#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 #ifndef DWMWA_BORDER_COLOR
 #define DWMWA_BORDER_COLOR 34
 #endif
+#ifndef DWMWA_EXTENDED_FRAME_BOUNDS
+#define DWMWA_EXTENDED_FRAME_BOUNDS 9
+#endif
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef PW_RENDERFULLCONTENT
+#define PW_RENDERFULLCONTENT 2
+#endif
 
 #undef GetCurrentTime
 
-#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Foundation.Collections.h>
-#include <winrt/Windows.UI.h>
+#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
@@ -54,17 +65,16 @@
 
 using namespace winrt::Windows::UI::Xaml;
 using winrt::Windows::Foundation::IInspectable;
-using winrt::Windows::UI::Color;
 
-constexpr int kTopBarHeight = 48;
 constexpr int kMagnifyPercent = 150;
 constexpr double kMagnifyRange = 90.0;
-std::atomic<bool> g_unloading;
+constexpr int kTopBarHeight = 48;
 std::atomic<bool> g_taskbarViewDllLoaded;
+std::atomic<bool> g_unloading;
 
 namespace Motion {
-constexpr int kFrameMs = 16;
 constexpr double kFollowTauMs = 55.0;
+constexpr int kFrameMs = 16;
 
 bool Enabled() {
     static std::atomic<int> cached{-1};
@@ -88,6 +98,17 @@ double Approach(double current, double target, double dtMs, double tauMs) {
         return target;
     return next;
 }
+}
+
+HBITMAP CreateDib(HDC dc, int w, int h, void** bits) {
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    return CreateDIBSection(dc, &bi, DIB_RGB_COLORS, bits, nullptr, 0);
 }
 
 template <typename F>
@@ -195,7 +216,6 @@ struct DockState {
 };
 
 struct ZoomEntry {
-    void* buttonKey = nullptr;
     winrt::weak_ref<UIElement> button;
     winrt::weak_ref<FrameworkElement> target;
     Media::ScaleTransform scale{nullptr};
@@ -204,9 +224,7 @@ struct ZoomEntry {
 };
 
 std::vector<std::shared_ptr<DockState>> g_states;
-std::vector<std::shared_ptr<ZoomEntry>> g_zooms;
-
-XamlRoot GetTaskbarXamlRoot(HWND hWnd, bool isSecondary);
+std::unordered_map<void*, std::shared_ptr<ZoomEntry>> g_zooms;
 
 void FindTrayIfNeeded(DockState& st) {
     if (st.tray.get())
@@ -283,12 +301,12 @@ void StyleStartButton(DockState& st) {
         return;
 
     std::vector<FrameworkElement> candidates;
-    int visited = 0;
-    CollectByClassOrName(frame, L"launchlistbutton", 0, 24, &candidates, &visited);
-    if (candidates.empty())
-        CollectByClassOrName(frame, L"startbutton", 0, 24, &candidates, &visited);
-    if (candidates.empty())
-        CollectByClassOrName(frame, L"start", 0, 24, &candidates, &visited);
+    for (auto needle : {L"launchlistbutton", L"startbutton"}) {
+        int visited = 0;
+        CollectByClassOrName(frame, needle, 0, 24, &candidates, &visited);
+        if (!candidates.empty())
+            break;
+    }
 
     if (candidates.empty())
         return;
@@ -314,53 +332,55 @@ FrameworkElement ZoomTarget(UIElement const& button) {
     return FindChild(button, [](FrameworkElement const&) { return true; });
 }
 
+void ApplyScale(ZoomEntry const& z) {
+    z.scale.ScaleX(z.currentScale);
+    z.scale.ScaleY(z.currentScale);
+}
+
+void BindZoom(ZoomEntry& z, FrameworkElement const& target) {
+    z.currentScale = 1.0;
+    z.targetScale = 1.0;
+    z.target = winrt::make_weak(target);
+    z.scale = Media::ScaleTransform();
+    SetProp(target, UIElement::RenderTransformProperty(), z.scale);
+    SetProp(target, UIElement::RenderTransformOriginProperty(),
+            winrt::box_value(winrt::Windows::Foundation::Point{0.5f, 0.5f}));
+}
+
 ZoomEntry* GetZoomEntry(UIElement const& button) {
     void* key = AbiKey(button);
-    for (auto& z : g_zooms) {
-        if (z->buttonKey == key && z->button.get()) {
-            if (auto target = z->target.get()) {
-                if (target.RenderTransform() == z->scale)
-                    return z.get();
-            }
-
-            auto target = ZoomTarget(button);
-            if (!target)
-                return nullptr;
-            z->currentScale = 1.0;
-            z->targetScale = 1.0;
-            z->target = winrt::make_weak(target);
-            z->scale = Media::ScaleTransform();
-            SetProp(target, UIElement::RenderTransformProperty(), z->scale);
-            SetProp(target, UIElement::RenderTransformOriginProperty(),
-                    winrt::box_value(winrt::Windows::Foundation::Point{0.5f, 0.5f}));
-            return z.get();
+    auto it = g_zooms.find(key);
+    if (it != g_zooms.end() && it->second->button.get()) {
+        auto& z = it->second;
+        if (auto target = z->target.get()) {
+            if (target.RenderTransform() == z->scale)
+                return z.get();
         }
+
+        auto target = ZoomTarget(button);
+        if (!target)
+            return nullptr;
+        BindZoom(*z, target);
+        return z.get();
     }
 
     auto target = ZoomTarget(button);
     if (!target)
         return nullptr;
     auto z = std::make_shared<ZoomEntry>();
-    z->buttonKey = key;
     z->button = winrt::make_weak(button);
-    z->target = winrt::make_weak(target);
-    z->scale = Media::ScaleTransform();
-    SetProp(target, UIElement::RenderTransformProperty(), z->scale);
-    SetProp(target, UIElement::RenderTransformOriginProperty(),
-            winrt::box_value(winrt::Windows::Foundation::Point{0.5f, 0.5f}));
-    g_zooms.push_back(z);
-    return z.get();
+    BindZoom(*z, target);
+    return (g_zooms[key] = z).get();
 }
 
 bool MagnifyTick(double dtMs) {
     bool busy = false;
-    for (auto& z : g_zooms) {
-        if (!z->scale || z->currentScale == z->targetScale)
+    for (auto& [key, z] : g_zooms) {
+        if (z->currentScale == z->targetScale)
             continue;
         z->currentScale =
             Motion::Approach(z->currentScale, z->targetScale, dtMs, Motion::kFollowTauMs);
-        z->scale.ScaleX(z->currentScale);
-        z->scale.ScaleY(z->currentScale);
+        ApplyScale(*z);
         busy = busy || z->currentScale != z->targetScale;
     }
     return busy;
@@ -368,12 +388,11 @@ bool MagnifyTick(double dtMs) {
 
 void EnsureMotion(DockState& st) {
     if (!Motion::Enabled()) {
-        for (auto& z : g_zooms) {
-            if (!z->scale || z->currentScale == z->targetScale)
+        for (auto& [key, z] : g_zooms) {
+            if (z->currentScale == z->targetScale)
                 continue;
             z->currentScale = z->targetScale;
-            z->scale.ScaleX(z->currentScale);
-            z->scale.ScaleY(z->currentScale);
+            ApplyScale(*z);
         }
         return;
     }
@@ -428,11 +447,9 @@ void SetMagnifyTargets(FrameworkElement const& repeater, double cursorX) {
 }
 
 void ReleaseMagnify() {
-    std::erase_if(g_zooms, [](auto const& z) { return !z->button.get(); });
-    for (auto& z : g_zooms) {
-        if (z->scale)
-            z->targetScale = 1.0;
-    }
+    std::erase_if(g_zooms, [](auto const& entry) { return !entry.second->button.get(); });
+    for (auto& [key, z] : g_zooms)
+        z->targetScale = 1.0;
 }
 
 void AttachMagnify(std::shared_ptr<DockState> state) {
@@ -526,6 +543,8 @@ void OnLayoutUpdated(std::weak_ptr<DockState> weak) {
     try {
         FindTrayIfNeeded(*st);
         StyleStartButton(*st);
+        if (st->timer && st->tray.get() && st->startButton.get())
+            st->timer.Stop();
     } catch (...) {}
 }
 
@@ -534,6 +553,7 @@ void ApplyToFrame(FrameworkElement const& frame) {
         return;
 
     std::erase_if(g_states, [](auto const& st) { return !st->frame.get(); });
+    std::erase_if(g_savedProps, [](auto const& s) { return !s.obj.get(); });
 
     auto repeater = FindDescendant(
         frame, [](FrameworkElement const& e) { return HasName(e, L"TaskbarFrameRepeater"); }, 6);
@@ -706,11 +726,8 @@ void ApplyToXamlRoot(XamlRoot const& xamlRoot) {
         }
     }
 
-    if (frame) {
+    if (frame)
         ApplyToFrame(frame);
-        return;
-    }
-
 }
 
 void RefreshFromTaskbarThread() {
@@ -776,8 +793,7 @@ void RunOnTaskbarThread() {
         return;
 
     DWORD_PTR result = 0;
-    if (!SendMessageTimeout(hTaskbarWnd, msg, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 5000,
-                            &result))
+    SendMessageTimeout(hTaskbarWnd, msg, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 5000, &result);
     UnhookWindowsHookEx(hook);
 }
 
@@ -802,17 +818,12 @@ bool HookTaskbarDllSymbols() {
         return false;
     }
 
-    {
-        void* frameHeightAddress = nullptr;
-        WindhawkUtils::SYMBOL_HOOK probe[] = {
-            {{LR"(public: int __cdecl TaskbarHost::FrameHeight(void)const )"},
-             &frameHeightAddress},
-        };
-        if (WindhawkUtils::HookSymbols(module, probe, ARRAYSIZE(probe)))
-            DetectTaskbarHostElementOffset(frameHeightAddress);
-    }
-
+    void* frameHeightAddress = nullptr;
     WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {{LR"(public: int __cdecl TaskbarHost::FrameHeight(void)const )"},
+         &frameHeightAddress,
+         nullptr,
+         true},
         {{LR"(const CTaskBand::`vftable'{for `ITaskListWndSite'})"},
          &CTaskBand_ITaskListWndSite_vftable},
         {{LR"(const CSecondaryTaskBand::`vftable'{for `ITaskListWndSite'})"},
@@ -824,8 +835,10 @@ bool HookTaskbarDllSymbols() {
         {{LR"(public: void __cdecl std::_Ref_count_base::_Decref(void))"},
          &std__Ref_count_base__Decref_Original},
     };
-    bool ok = WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks));
-    return ok;
+    if (!WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks)))
+        return false;
+    DetectTaskbarHostElementOffset(frameHeightAddress);
+    return true;
 }
 
 bool HookTaskbarViewDllSymbols(HMODULE module) {
@@ -835,10 +848,7 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
          TaskbarFrame_OnLoaded_Hook,
          true},
     };
-    if (!WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks))) {
-        return false;
-    }
-    return true;
+    return WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks));
 }
 
 HMODULE GetTaskbarViewModuleHandle() {
@@ -872,9 +882,15 @@ HANDLE g_thread = nullptr;
 std::atomic<HWND> g_wnd{nullptr};
 std::vector<Item> g_items;
 bool g_appBar = false;
+bool g_fullscreen = false;
 constexpr UINT kAppBarMsg = WM_APP + 42;
-constexpr UINT kRadioMsg = WM_APP + 43;
 constexpr WCHAR kClassName[] = L"MinimalistTopBar";
+constexpr WCHAR kRadioKey[] = L"SYSTEM\\CurrentControlSet\\Control\\RadioManagement";
+constexpr UINT kRadioMsg = WM_APP + 43;
+constexpr BYTE kVignettePeak = 64;
+HWND g_vignette = nullptr;
+
+namespace Radios = winrt::Windows::Devices::Radios;
 
 void PressKeys(std::initializer_list<WORD> keys) {
     std::vector<INPUT> inputs;
@@ -927,7 +943,7 @@ int BarHeightPx(HWND hwnd) {
     return MulDiv(kTopBarHeight, dpi, 96);
 }
 
-void ApplyBlur(HWND hwnd) {
+void ApplyChrome(HWND hwnd) {
     BOOL excluded = TRUE;
     DwmSetWindowAttribute(hwnd, DWMWA_EXCLUDED_FROM_PEEK, &excluded, sizeof(excluded));
     int corner = DWMWCP_DONOTROUND;
@@ -952,8 +968,8 @@ void PositionBar(HWND hwnd) {
         SHAppBarMessage(ABM_SETPOS, &abd);
         rc = abd.rc;
     }
-    SetWindowPos(hwnd, HWND_TOPMOST, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
-                 SWP_NOACTIVATE);
+    SetWindowPos(hwnd, g_fullscreen ? HWND_BOTTOM : HWND_TOPMOST, rc.left, rc.top,
+                 rc.right - rc.left, rc.bottom - rc.top, SWP_NOACTIVATE);
 }
 
 std::wstring DateText() {
@@ -981,8 +997,8 @@ float EdgePadding(float scale) {
 
 bool IsAirplaneMode() {
     DWORD value = 0, size = sizeof(value);
-    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\RadioManagement",
-                     L"SystemRadioState", RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS)
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, kRadioKey, L"SystemRadioState", RRF_RT_REG_DWORD,
+                     nullptr, &value, &size) != ERROR_SUCCESS)
         return false;
     return value != 0;
 }
@@ -993,11 +1009,12 @@ struct RadioSnapshot {
     bool bluetoothOn = false;
 };
 
-std::atomic<bool> g_radioStop{false};
-HANDLE g_radioThread = nullptr;
-std::mutex g_radioMutex;
 bool g_radioAirplane = false;
 bool g_radioBluetooth = false;
+HANDLE g_radioChangeEvent = nullptr;
+std::mutex g_radioMutex;
+HANDLE g_radioStopEvent = nullptr;
+HANDLE g_radioThread = nullptr;
 
 DWORD WINAPI RadioThreadProc(void*) {
     bool apartment = false;
@@ -1006,20 +1023,43 @@ DWORD WINAPI RadioThreadProc(void*) {
         apartment = true;
     } catch (...) {}
 
-    while (!g_radioStop) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRadioKey, 0, KEY_NOTIFY, &key) != ERROR_SUCCESS)
+        key = nullptr;
+
+    std::vector<std::pair<Radios::Radio, winrt::event_token>> subscriptions;
+    auto unsubscribe = [&] {
+        for (auto& [radio, token] : subscriptions) {
+            try {
+                radio.StateChanged(token);
+            } catch (...) {}
+        }
+        subscriptions.clear();
+    };
+
+    HANDLE waits[] = {g_radioStopEvent, g_radioChangeEvent};
+    do {
+        if (key)
+            RegNotifyChangeKeyValue(key, TRUE, REG_NOTIFY_CHANGE_LAST_SET, g_radioChangeEvent,
+                                    TRUE);
+        unsubscribe();
+
         RadioSnapshot snap;
         try {
-            auto op = winrt::Windows::Devices::Radios::Radio::GetRadiosAsync();
+            auto op = Radios::Radio::GetRadiosAsync();
             if (op.wait_for(std::chrono::seconds(2)) ==
                 winrt::Windows::Foundation::AsyncStatus::Completed) {
                 for (auto const& radio : op.GetResults()) {
                     snap.known = true;
-                    bool on = radio.State() == winrt::Windows::Devices::Radios::RadioState::On;
-                    if (on) {
+                    if (radio.State() == Radios::RadioState::On) {
                         snap.anyOn = true;
-                        if (radio.Kind() == winrt::Windows::Devices::Radios::RadioKind::Bluetooth)
+                        if (radio.Kind() == Radios::RadioKind::Bluetooth)
                             snap.bluetoothOn = true;
                     }
+                    subscriptions.emplace_back(
+                        radio, radio.StateChanged([](Radios::Radio const&, IInspectable const&) {
+                            SetEvent(g_radioChangeEvent);
+                        }));
                 }
             } else {
                 op.Cancel();
@@ -1040,10 +1080,11 @@ DWORD WINAPI RadioThreadProc(void*) {
                 PostMessage(bar, kRadioMsg, 0, 0);
         }
 
-        for (int i = 0; i < 50 && !g_radioStop; i++)
-            Sleep(100);
-    }
+    } while (WaitForMultipleObjects(2, waits, FALSE, 60000) != WAIT_OBJECT_0);
 
+    unsubscribe();
+    if (key)
+        RegCloseKey(key);
     if (apartment) {
         try {
             winrt::uninit_apartment();
@@ -1055,17 +1096,22 @@ DWORD WINAPI RadioThreadProc(void*) {
 void StartRadioWorker() {
     if (g_radioThread)
         return;
-    g_radioStop = false;
+    g_radioStopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    g_radioChangeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     g_radioThread = CreateThread(nullptr, 0, RadioThreadProc, nullptr, 0, nullptr);
 }
 
 void StopRadioWorker() {
-    g_radioStop = true;
     if (!g_radioThread)
         return;
+    SetEvent(g_radioStopEvent);
     WaitForSingleObject(g_radioThread, 4000);
     CloseHandle(g_radioThread);
+    CloseHandle(g_radioStopEvent);
+    CloseHandle(g_radioChangeEvent);
     g_radioThread = nullptr;
+    g_radioStopEvent = nullptr;
+    g_radioChangeEvent = nullptr;
 }
 
 void ReadRadioIcons(bool* airplane, bool* bluetooth) {
@@ -1107,14 +1153,15 @@ bool g_paintKeyValid = false;
 void Paint(HWND hwnd);
 void PresentLayered(HWND hwnd);
 
-constexpr UINT_PTR kPollTimerId = 1;
-constexpr UINT_PTR kClockTimerId = 3;
+std::unique_ptr<Gdiplus::Font> g_clockFont;
+float g_clockFontSize = 0.0f;
 
-constexpr UINT_PTR kPulseTimerId = 4;
-constexpr double kPulseScale = 1.25;
-constexpr double kPulseInMs = 320.0;
+constexpr UINT_PTR kClockTimerId = 3;
 constexpr double kPulseHoldMs = 1000.0;
+constexpr double kPulseInMs = 320.0;
 constexpr double kPulseOutMs = 450.0;
+constexpr double kPulseScale = 1.25;
+constexpr UINT_PTR kPulseTimerId = 4;
 double g_batteryScale = 1.0;
 ULONGLONG g_pulseStart = 0;
 
@@ -1148,7 +1195,7 @@ bool PulseStep(double elapsed, double& scale) {
         e = 1.0;
     } else {
         double t = (elapsed - kPulseInMs - kPulseHoldMs) / kPulseOutMs;
-        e = t < 0.5 ? 1.0 - 4.0 * t * t * t : 1.0 - (1.0 - std::pow(-2.0 * t + 2.0, 3.0) / 2.0);
+        e = t < 0.5 ? 1.0 - 4.0 * t * t * t : std::pow(-2.0 * t + 2.0, 3.0) / 2.0;
     }
     scale = 1.0 + (kPulseScale - 1.0) * e;
     return true;
@@ -1235,18 +1282,10 @@ bool EnsureSurface(int w, int h) {
     if (!g_screenDC)
         return false;
 
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-
     g_surfaceDC = CreateCompatibleDC(g_screenDC);
     if (!g_surfaceDC)
         return false;
-    g_surfaceBmp = CreateDIBSection(g_surfaceDC, &bi, DIB_RGB_COLORS, &g_surfaceBits, nullptr, 0);
+    g_surfaceBmp = CreateDib(g_surfaceDC, w, h, &g_surfaceBits);
     if (!g_surfaceBmp) {
         DeleteDC(g_surfaceDC);
         g_surfaceDC = nullptr;
@@ -1258,7 +1297,46 @@ bool EnsureSurface(int w, int h) {
     return true;
 }
 
+void PresentVignette() {
+    if (!g_vignette || !g_screenDC)
+        return;
+    HWND tray = FindWindow(L"Shell_TrayWnd", nullptr);
+    RECT r;
+    int w = 0, h = 0;
+    if (!g_fullscreen && tray && GetWindowRect(tray, &r)) {
+        w = r.right - r.left;
+        h = r.bottom - r.top;
+    }
+    if (w <= 0 || h <= 0) {
+        ShowWindow(g_vignette, SW_HIDE);
+        return;
+    }
+
+    HDC dc = CreateCompatibleDC(g_screenDC);
+    void* bits = nullptr;
+    HBITMAP bitmap = dc ? CreateDib(dc, w, h, &bits) : nullptr;
+    if (bitmap && bits) {
+        HGDIOBJ old = SelectObject(dc, bitmap);
+        for (int y = 0; y < h; y++)
+            std::fill_n((DWORD*)bits + (size_t)y * w, w, (DWORD)(kVignettePeak * (y + 1) / h) << 24);
+        SetWindowPos(g_vignette, tray, r.left, r.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        POINT dst{r.left, r.top};
+        SIZE size{w, h};
+        POINT src{0, 0};
+        BYTE alpha = (BYTE)std::lround(std::clamp(g_winAlpha, 0.0, 1.0) * 255.0);
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+        UpdateLayeredWindow(g_vignette, g_screenDC, &dst, &size, dc, &src, 0, &blend,
+                            ULW_ALPHA);
+        SelectObject(dc, old);
+    }
+    if (bitmap)
+        DeleteObject(bitmap);
+    if (dc)
+        DeleteDC(dc);
+}
+
 void PresentLayered(HWND hwnd) {
+    PresentVignette();
     if (!hwnd || !g_surfaceDC || g_surfaceW <= 0 || g_surfaceH <= 0)
         return;
     RECT wr{};
@@ -1302,6 +1380,13 @@ void Paint(HWND hwnd) {
             g.FillRectangle(&hitBrush, RectF(0.0f, 0.0f, (REAL)w, (REAL)h));
         }
 
+        {
+            LinearGradientBrush shade(PointF(0.0f, 0.0f), PointF(0.0f, (REAL)h),
+                                      Gdiplus::Color(kVignettePeak, 0, 0, 0),
+                                      Gdiplus::Color(0, 0, 0, 0));
+            g.FillRectangle(&shade, RectF(0.0f, 0.0f, (REAL)w, (REAL)h));
+        }
+
         StringFormat fmt(StringFormat::GenericTypographic());
         fmt.SetLineAlignment(StringAlignmentCenter);
         fmt.SetFormatFlags(fmt.GetFormatFlags() | StringFormatFlagsMeasureTrailingSpaces);
@@ -1315,9 +1400,15 @@ void Paint(HWND hwnd) {
         float u = s;
         float cy = h / 2.0f;
 
-        Font clockFont(L"Segoe UI Variable Text", 14.0f * u, FontStyleRegular, UnitPixel);
-        Font clockFallback(L"Segoe UI", 14.0f * u, FontStyleRegular, UnitPixel);
-        Font& cf = clockFont.IsAvailable() ? clockFont : clockFallback;
+        if (!g_clockFont || g_clockFontSize != 14.0f * u) {
+            g_clockFont = std::make_unique<Font>(L"Segoe UI Variable Text", 14.0f * u,
+                                                 FontStyleRegular, UnitPixel);
+            if (!g_clockFont->IsAvailable())
+                g_clockFont =
+                    std::make_unique<Font>(L"Segoe UI", 14.0f * u, FontStyleRegular, UnitPixel);
+            g_clockFontSize = 14.0f * u;
+        }
+        Font& cf = *g_clockFont;
         std::wstring dateText = DateText();
         std::wstring timeText = TimeText();
         float timeW = measure(timeText, cf);
@@ -1325,7 +1416,6 @@ void Paint(HWND hwnd) {
 
         float edge = EdgePadding(s);
 
-        bool showStart = true;
         float startSize = 12.0f * u;
         float startL = edge;
         float startGap = 1.1f * u;
@@ -1359,8 +1449,7 @@ void Paint(HWND hwnd) {
         auto addItem = [&](float l, float r, float padL, float padR, Action action) {
             items.push_back({{(LONG)(l - padL), 0, (LONG)(r + padR), h}, action});
         };
-        if (showStart)
-            addItem(startL, startL + startSize, 10 * u, 12 * u, kStart);
+        addItem(startL, startL + startSize, 10 * u, 12 * u, kStart);
         if (airplane)
             addItem(apL, apR, 8 * u, 11 * u, kQuickSettings);
         if (bluetooth)
@@ -1401,7 +1490,7 @@ void Paint(HWND hwnd) {
                                  color.GetB());
             SolidBrush faintBrush(faint);
 
-            if (showStart) {
+            {
                 float x0 = startL;
                 float y0 = cy - startSize / 2 + dy;
                 auto pane = [&](float x, float y) {
@@ -1521,11 +1610,6 @@ void Paint(HWND hwnd) {
 
     g_items = std::move(items);
 
-    static bool loggedEmpty = false;
-    if (g_items.empty() && !loggedEmpty) {
-        loggedEmpty = true;
-    }
-
     PresentLayered(hwnd);
 }
 
@@ -1584,7 +1668,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ArmClockTimer(hwnd);
                 return 0;
             }
-            RefreshBar(hwnd);
             return 0;
         }
         case kRadioMsg:
@@ -1615,8 +1698,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         case kAppBarMsg:
-            if (wParam == ABN_POSCHANGED)
+            if (wParam == ABN_FULLSCREENAPP) {
+                g_fullscreen = lParam != 0;
+                SetWindowPos(hwnd, g_fullscreen ? HWND_BOTTOM : HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+            } else if (wParam == ABN_POSCHANGED) {
                 PositionBar(hwnd);
+            }
+            PresentVignette();
             return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
@@ -1625,9 +1714,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             Paint(hwnd);
             return 0;
         case WM_SETTINGCHANGE:
-            ApplyBlur(hwnd);
-            g_paintKeyValid = false;
-            Paint(hwnd);
+            if (lParam && wcscmp((LPCWSTR)lParam, L"intl") == 0) {
+                g_paintKeyValid = false;
+                Paint(hwnd);
+            }
             break;
         case WM_CLOSE:
 
@@ -1640,7 +1730,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
-            KillTimer(hwnd, kPollTimerId);
             KillTimer(hwnd, kClockTimerId);
             KillTimer(hwnd, kMotionTimerId);
             KillTimer(hwnd, kPulseTimerId);
@@ -1677,12 +1766,15 @@ DWORD WINAPI ThreadProc(void*) {
         kTopBarHeight, nullptr, nullptr, instance, nullptr);
 
     if (hwnd) {
+        g_vignette = CreateWindowEx(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, L"STATIC",
+            nullptr, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
         g_wnd = hwnd;
         APPBARDATA abd{sizeof(abd)};
         abd.hWnd = hwnd;
         abd.uCallbackMessage = kAppBarMsg;
         g_appBar = SHAppBarMessage(ABM_NEW, &abd) != 0;
-        ApplyBlur(hwnd);
+        ApplyChrome(hwnd);
         PositionBar(hwnd);
         g_winAlpha = Motion::Enabled() ? 0.0 : 1.0;
         g_winAlphaTarget = 1.0;
@@ -1692,7 +1784,6 @@ DWORD WINAPI ThreadProc(void*) {
         g_paintKey = CurrentPaintKey();
         g_paintKeyValid = true;
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        SetTimer(hwnd, kPollTimerId, 30000, nullptr);
         ArmClockTimer(hwnd);
         StartBarMotion();
 
@@ -1703,9 +1794,14 @@ DWORD WINAPI ThreadProc(void*) {
         }
     }
 
+    if (g_vignette) {
+        DestroyWindow(g_vignette);
+        g_vignette = nullptr;
+    }
     g_wnd = nullptr;
     g_items.clear();
     StopRadioWorker();
+    g_clockFont.reset();
     DestroySurface();
     if (g_screenDC) {
         ReleaseDC(nullptr, g_screenDC);
@@ -1736,24 +1832,856 @@ bool Stop() {
 }
 }
 
-BOOL Wh_ModInit() {
-    if (!HookTaskbarDllSymbols()) {
-        return FALSE;
+namespace Genie {
+using Clock = std::chrono::steady_clock;
+
+constexpr int kDurationMs = 125;
+constexpr float kFadeSpan = 0.125f;
+constexpr int kFirstFrameWaitMs = 200;
+constexpr long long kMaxPixels = 64LL * 1024 * 1024;
+constexpr int kMinSizePx = 40;
+constexpr float kNeckMax = 60.0f;
+constexpr float kNeckMin = 12.0f;
+constexpr float kNeckRatio = 0.03f;
+constexpr float kSpread = 0.65f;
+
+struct Job {
+    HBITMAP bitmap = nullptr;
+    void* bits = nullptr;
+    int dockX = 0;
+    HANDLE firstFrame = nullptr;
+    int h = 0;
+    HWND hwnd = nullptr;
+    HMONITOR monitor = nullptr;
+    RECT rect{};
+    bool rising = false;
+    int w = 0;
+
+    ~Job() {
+        if (bitmap)
+            DeleteObject(bitmap);
+        if (firstFrame)
+            CloseHandle(firstFrame);
     }
+};
+
+struct Plan {
+    bool above = false;
+    RECT bounds{};
+    float dockX = 0.0f;
+    float dockY = 0.0f;
+    float neck = 0.0f;
+};
+
+struct Snapshot {
+    HBITMAP bitmap;
+    void* bits;
+    int h;
+    int w;
+};
+
+std::unordered_set<HWND> g_active;
+std::unordered_map<HWND, int> g_iconX;
+std::mutex g_mutex;
+std::unordered_map<HWND, Snapshot> g_snapshots;
+std::vector<HANDLE> g_workers;
+std::mutex g_workersMutex;
+
+class Canvas {
+public:
+    BYTE* bits = nullptr;
+    int h = 0;
+    int left = 0;
+    int top = 0;
+    int w = 0;
+
+    ~Canvas() {
+        if (m_dc) {
+            if (m_old)
+                SelectObject(m_dc, m_old);
+            DeleteDC(m_dc);
+        }
+        if (m_bitmap)
+            DeleteObject(m_bitmap);
+        if (m_screen)
+            ReleaseDC(nullptr, m_screen);
+        if (m_ghost)
+            DestroyWindow(m_ghost);
+    }
+
+    bool Create(RECT const& r) {
+        left = r.left;
+        top = r.top;
+        w = std::max<int>(1, r.right - r.left);
+        h = std::max<int>(1, r.bottom - r.top);
+        m_ghost = CreateWindowEx(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT, L"STATIC",
+            nullptr, WS_POPUP, left, top, w, h, nullptr, nullptr, nullptr, nullptr);
+        m_screen = GetDC(nullptr);
+        if (m_screen) {
+            m_bitmap = CreateDib(m_screen, w, h, (void**)&bits);
+            m_dc = CreateCompatibleDC(m_screen);
+        }
+        if (m_bitmap && m_dc)
+            m_old = SelectObject(m_dc, m_bitmap);
+        return m_ghost && m_screen && m_bitmap && bits && m_dc && m_old;
+    }
+
+    void Present(BYTE alpha) {
+        POINT dst{left, top};
+        SIZE size{w, h};
+        POINT src{0, 0};
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+        UpdateLayeredWindow(m_ghost, m_screen, &dst, &size, m_dc, &src, 0, &blend, ULW_ALPHA);
+    }
+
+    void Show() {
+        ShowWindow(m_ghost, SW_SHOWNOACTIVATE);
+    }
+
+private:
+    HDC m_dc = nullptr;
+    HWND m_ghost = nullptr;
+    HBITMAP m_bitmap = nullptr;
+    HGDIOBJ m_old = nullptr;
+    HDC m_screen = nullptr;
+};
+
+class Pacer {
+public:
+    Pacer() {
+        DWM_TIMING_INFO info{};
+        info.cbSize = sizeof(info);
+        if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &info)) &&
+            info.rateRefresh.uiNumerator)
+            m_intervalMs = 500.0 * info.rateRefresh.uiDenominator / info.rateRefresh.uiNumerator;
+        m_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                         TIMER_MODIFY_STATE | SYNCHRONIZE);
+        if (!m_timer)
+            m_timer = CreateWaitableTimerExW(nullptr, nullptr, 0,
+                                             TIMER_MODIFY_STATE | SYNCHRONIZE);
+    }
+
+    ~Pacer() {
+        if (m_timer)
+            CloseHandle(m_timer);
+    }
+
+    void Wait(Clock::time_point frameStart) {
+        if (!m_timer) {
+            Sleep(1);
+            return;
+        }
+        double spentMs = std::chrono::duration<double, std::milli>(Clock::now() - frameStart).count();
+        double waitMs = m_intervalMs - spentMs;
+        if (waitMs <= 0.1) {
+            SwitchToThread();
+            return;
+        }
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(waitMs * 10000.0);
+        SetWaitableTimer(m_timer, &due, 0, nullptr, nullptr, FALSE);
+        WaitForSingleObject(m_timer, 100);
+    }
+
+private:
+    double m_intervalMs = 1000.0 / 240.0;
+    HANDLE m_timer = nullptr;
+};
+
+std::wstring Lower(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
+    return s;
+}
+
+void SetCloak(HWND hwnd, BOOL cloak) {
+    DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+}
+
+void SetTransitions(HWND hwnd, bool enable) {
+    BOOL disable = !enable;
+    DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable));
+}
+
+void Revert(HWND hwnd, bool rising) {
+    if (rising)
+        SetCloak(hwnd, FALSE);
+    SetTransitions(hwnd, true);
+}
+
+bool ShouldAnimate(HWND hwnd) {
+    if (!hwnd || g_unloading || !Motion::Enabled())
+        return false;
+    if (GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CHILD)
+        return false;
+    RECT r;
+    if (IsIconic(hwnd)) {
+        WINDOWPLACEMENT wp{sizeof(wp)};
+        if (!GetWindowPlacement(hwnd, &wp))
+            return false;
+        r = wp.rcNormalPosition;
+    } else if (!GetWindowRect(hwnd, &r)) {
+        return false;
+    }
+    return r.right - r.left >= kMinSizePx && r.bottom - r.top >= kMinSizePx;
+}
+
+HWND FindTaskbar(HMONITOR monitor) {
+    HWND primary = FindWindow(L"Shell_TrayWnd", nullptr);
+    if (!monitor || MonitorFromWindow(primary, MONITOR_DEFAULTTOPRIMARY) == monitor)
+        return primary;
+    for (HWND w = nullptr; (w = FindWindowEx(nullptr, w, L"Shell_SecondaryTrayWnd", nullptr));) {
+        if (MonitorFromWindow(w, MONITOR_DEFAULTTONULL) == monitor)
+            return w;
+    }
+    return primary;
+}
+
+std::wstring ProcessName(HWND hwnd) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    HANDLE process = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : nullptr;
+    if (!process)
+        return {};
+    WCHAR path[MAX_PATH];
+    DWORD size = MAX_PATH;
+    std::wstring name;
+    if (QueryFullProcessImageName(process, 0, path, &size)) {
+        std::wstring_view full(path, size);
+        auto base = full.substr(full.find_last_of(L'\\') + 1);
+        name = std::wstring(base.substr(0, base.find(L'.')));
+    }
+    CloseHandle(process);
+    return Lower(name);
+}
+
+int ScoreButton(std::wstring const& name, std::wstring const& title, std::wstring const& process) {
+    if (name.empty())
+        return 0;
+    auto has = [&](std::wstring const& s) {
+        return !s.empty() && name.find(s) != std::wstring::npos;
+    };
+    int score = 0;
+    if (title == name)
+        score += 1000;
+    if (!title.empty()) {
+        if (title.find(name) != std::wstring::npos)
+            score += 500;
+        if (name.find(title) != std::wstring::npos)
+            score += 500;
+    }
+    if (has(process))
+        score += 400;
+    if (process == L"chrome" && has(L"google chrome"))
+        score += 900;
+    if (process == L"msedge" && has(L"microsoft edge"))
+        score += 900;
+
+    std::wstring word;
+    auto flush = [&] {
+        if (has(word) && word.size() >= 4)
+            score += 50;
+        word.clear();
+    };
+    for (wchar_t c : title) {
+        if (iswalnum(c))
+            word += c;
+        else
+            flush();
+    }
+    flush();
+
+    for (PCWSTR unwanted : {L"start", L"search", L"task view", L"widgets"}) {
+        if (has(unwanted))
+            score -= 500;
+    }
+    return score;
+}
+
+bool QueryIconX(HWND app, HMONITOR monitor, int& x) {
+    winrt::com_ptr<IUIAutomation> automation;
+    if (FAILED(CoCreateInstance(__uuidof(CUIAutomation8), nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(automation.put()))) &&
+        FAILED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(automation.put()))))
+        return false;
+
+    HWND tray = FindTaskbar(monitor);
+    winrt::com_ptr<IUIAutomationElement> root;
+    if (!tray || FAILED(automation->ElementFromHandle(tray, root.put())))
+        return false;
+
+    VARIANT type{};
+    type.vt = VT_I4;
+    winrt::com_ptr<IUIAutomationCondition> button, listItem, either;
+    type.lVal = UIA_ButtonControlTypeId;
+    automation->CreatePropertyCondition(UIA_ControlTypePropertyId, type, button.put());
+    type.lVal = UIA_ListItemControlTypeId;
+    automation->CreatePropertyCondition(UIA_ControlTypePropertyId, type, listItem.put());
+    if (!button || !listItem ||
+        FAILED(automation->CreateOrCondition(button.get(), listItem.get(), either.put())))
+        return false;
+
+    winrt::com_ptr<IUIAutomationElementArray> items;
+    if (FAILED(root->FindAll(TreeScope_Descendants, either.get(), items.put())) || !items)
+        return false;
+
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfo(monitor, &mi);
+    WCHAR text[512]{};
+    GetWindowText(app, text, ARRAYSIZE(text));
+    std::wstring title = Lower(text);
+    std::wstring process = ProcessName(app);
+
+    int count = 0;
+    items->get_Length(&count);
+    int best = 0;
+    for (int i = 0; i < count; i++) {
+        winrt::com_ptr<IUIAutomationElement> item;
+        BSTR name = nullptr;
+        if (FAILED(items->GetElement(i, item.put())) || FAILED(item->get_CurrentName(&name)) ||
+            !name)
+            continue;
+        int score = ScoreButton(Lower(name), title, process);
+        SysFreeString(name);
+        RECT r;
+        if (score > best && SUCCEEDED(item->get_CurrentBoundingRectangle(&r)) &&
+            r.right > r.left && r.left < mi.rcMonitor.right - 50) {
+            best = score;
+            x = (r.left + r.right) / 2;
+        }
+    }
+    return best > 0;
+}
+
+int DockX(HWND hwnd, HMONITOR monitor, RECT const& mon) {
+    int x = (mon.left + mon.right) / 2;
+    POINT pt;
+    GetCursorPos(&pt);
+    MONITORINFO cursorMon{sizeof(cursorMon)};
+    if (!GetMonitorInfo(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &cursorMon))
+        SystemParametersInfo(SPI_GETWORKAREA, 0, &cursorMon.rcWork, 0);
+
+    bool found = false;
+    if (!PtInRect(&cursorMon.rcWork, pt)) {
+        x = pt.x;
+        found = true;
+    } else {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
+            found = QueryIconX(hwnd, monitor, x);
+            if (SUCCEEDED(hr))
+                CoUninitialize();
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (found)
+        g_iconX[hwnd] = x;
+    else if (auto it = g_iconX.find(hwnd); it != g_iconX.end())
+        x = it->second;
+    return x;
+}
+
+void CopySnapshot(DWORD const* src, int rawW, int rawH, int offsetX, int offsetY, Job& job) {
+    DWORD* dst = (DWORD*)job.bits;
+    int inBounds = 0, transparent = 0;
+    for (int y = 0; y < job.h; y++) {
+        for (int x = 0; x < job.w; x++) {
+            int sx = x + offsetX, sy = y + offsetY;
+            DWORD p = 0;
+            if (sx >= 0 && sx < rawW && sy >= 0 && sy < rawH) {
+                p = src[sy * rawW + sx];
+                inBounds++;
+                if ((p >> 24) == 0) {
+                    transparent++;
+                    p = 0;
+                }
+            }
+            dst[y * job.w + x] = p;
+        }
+    }
+    if (inBounds == 0 || transparent * 2 <= inBounds)
+        return;
+    for (int y = 0; y < job.h; y++) {
+        for (int x = 0; x < job.w; x++) {
+            int sx = x + offsetX, sy = y + offsetY;
+            if (sx < 0 || sx >= rawW || sy < 0 || sy >= rawH)
+                continue;
+            DWORD p = src[sy * rawW + sx];
+            if ((p >> 24) == 0)
+                dst[y * job.w + x] = 0xFF000000u | (p & 0x00FFFFFFu);
+        }
+    }
+}
+
+bool Capture(HDC screen, RECT const& win, Job& job) {
+    int rawW = win.right - win.left, rawH = win.bottom - win.top;
+    HDC dc = CreateCompatibleDC(screen);
+    if (!dc)
+        return false;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDib(screen, rawW, rawH, &bits);
+    bool ok = bitmap && bits;
+    if (ok) {
+        HGDIOBJ old = SelectObject(dc, bitmap);
+        PrintWindow(job.hwnd, dc, PW_RENDERFULLCONTENT);
+        GdiFlush();
+        CopySnapshot((DWORD const*)bits, rawW, rawH, job.rect.left - win.left,
+                     job.rect.top - win.top, job);
+        SelectObject(dc, old);
+    }
+    if (bitmap)
+        DeleteObject(bitmap);
+    DeleteDC(dc);
+    return ok;
+}
+
+bool TakeCached(Job& job) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_snapshots.find(job.hwnd);
+    if (it == g_snapshots.end())
+        return false;
+    Snapshot snap = it->second;
+    g_snapshots.erase(it);
+    bool fits = snap.w == job.w && snap.h == job.h;
+    if (fits)
+        memcpy(job.bits, snap.bits, (size_t)job.w * job.h * 4);
+    DeleteObject(snap.bitmap);
+    return fits;
+}
+
+void Cache(HDC screen, Job const& job) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (auto it = g_snapshots.find(job.hwnd); it != g_snapshots.end()) {
+        DeleteObject(it->second.bitmap);
+        g_snapshots.erase(it);
+    }
+    if (g_unloading)
+        return;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDib(screen, job.w, job.h, &bits);
+    if (!bitmap || !bits) {
+        if (bitmap)
+            DeleteObject(bitmap);
+        return;
+    }
+    memcpy(bits, job.bits, (size_t)job.w * job.h * 4);
+    g_snapshots[job.hwnd] = {bitmap, bits, job.h, job.w};
+}
+
+float Morph(float v, float t) {
+    float m = std::clamp(t * (1.0f + kSpread) - (1.0f - v) * kSpread, 0.0f, 1.0f);
+    return m * m * (3.0f - 2.0f * m);
+}
+
+bool MakePlan(Job const& job, Plan& plan) {
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfo(job.monitor, &mi))
+        return false;
+    RECT const& mon = mi.rcMonitor;
+    RECT const& win = job.rect;
+
+    int dockX = std::clamp<int>(job.dockX, mon.left, mon.right);
+    float dockY = (float)mon.bottom;
+    RECT tray;
+    if (GetWindowRect(FindTaskbar(job.monitor), &tray) && tray.bottom > tray.top &&
+        tray.top + tray.bottom < mon.top + mon.bottom)
+        dockY = (float)mon.top;
+
+    plan.above = dockY < (float)(win.top + win.bottom) * 0.5f;
+    dockY = plan.above ? std::min(dockY, (float)win.top) : std::max(dockY, (float)win.bottom);
+    plan.dockX = (float)dockX;
+    plan.dockY = dockY;
+    plan.neck = std::clamp(job.w * kNeckRatio, kNeckMin, kNeckMax);
+
+    RECT b;
+    b.left = std::min<int>(win.left, dockX) - job.w / 2;
+    b.right = std::max<int>(win.right, dockX) + job.w / 2;
+    b.top = std::min<int>(win.top, (int)dockY);
+    b.bottom = std::max<int>(win.bottom, (int)dockY);
+
+    b.left = std::min<int>(std::max<int>(b.left, mon.left), std::min<int>(win.left, dockX - 16));
+    b.right = std::max<int>(std::min<int>(b.right, mon.right), std::max<int>(win.right, dockX + 16));
+    b.top = std::min<int>(std::max<int>(b.top, mon.top), win.top);
+    b.bottom = std::max<int>(std::min<int>(b.bottom, mon.bottom), win.bottom);
+
+    int vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN), vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN), vHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (vWidth > 0 && vHeight > 0) {
+        b.left = std::max<int>(b.left, vLeft);
+        b.top = std::max<int>(b.top, vTop);
+        b.right = std::min<int>(b.right, vLeft + vWidth);
+        b.bottom = std::min<int>(b.bottom, vTop + vHeight);
+    }
+    plan.bounds = b;
+    return b.right > b.left && b.bottom > b.top &&
+           (long long)(b.right - b.left) * (b.bottom - b.top) <= kMaxPixels;
+}
+
+void RenderFrame(Job const& job, Plan const& plan, Canvas& canvas, std::vector<float>& rows,
+                 float t) {
+    int const W = job.w, H = job.h;
+    float const centerX = job.rect.left + W * 0.5f;
+    memset(canvas.bits, 0, (size_t)canvas.w * canvas.h * 4);
+
+    for (int k = 0; k <= H; k++) {
+        float v = (float)k / H;
+        float ideal = (float)job.rect.top + H * v;
+        rows[k] = ideal + (plan.dockY - ideal) * Morph(plan.above ? 1.0f - v : v, t);
+    }
+
+    int seg = 0;
+    for (int y = 0; y < canvas.h; y++) {
+        float screenY = (float)(y + canvas.top) + 0.5f;
+        if (screenY < rows[0] || screenY >= rows[H])
+            continue;
+        while (seg < H - 1 && rows[seg + 1] <= screenY)
+            seg++;
+        float segH = rows[seg + 1] - rows[seg];
+        float v = ((float)seg + (segH > 1e-4f ? (screenY - rows[seg]) / segH : 0.0f)) / H;
+        float morph = Morph(plan.above ? 1.0f - v : v, t);
+        float width = std::max(1.0f, W + (plan.neck - W) * morph);
+        float left = centerX + (plan.dockX - centerX) * morph - width * 0.5f - canvas.left;
+
+        int srcRow = std::clamp((int)(v * H), 0, H - 1);
+        DWORD const* src = (DWORD const*)job.bits + (size_t)srcRow * W;
+        DWORD* dst = (DWORD*)(canvas.bits + (size_t)y * canvas.w * 4);
+        int from = std::max(0, (int)left), to = std::min(canvas.w, (int)(left + width) + 1);
+        for (int x = from; x < to; x++) {
+            float u = ((float)x + 0.5f - left) / width;
+            if (u >= 0.0f && u < 1.0f)
+                dst[x] = src[std::min((int)(u * W), W - 1)];
+        }
+    }
+}
+
+void Play(Job const& job, Plan const& plan, Canvas& canvas) {
+    Pacer pacer;
+    std::vector<float> rows(job.h + 1);
+    auto start = Clock::now();
+    bool first = true;
+    for (;;) {
+        auto frameStart = Clock::now();
+        double elapsedMs = std::chrono::duration<double, std::milli>(frameStart - start).count();
+        bool last = elapsedMs >= kDurationMs;
+        float progress = last ? 1.0f : (float)(elapsedMs / kDurationMs);
+        float t = job.rising ? 1.0f - progress : progress;
+        float fade = std::clamp((1.0f - t) / kFadeSpan, 0.0f, 1.0f);
+
+        RenderFrame(job, plan, canvas, rows, t);
+        canvas.Present((BYTE)(255.0f * fade));
+        if (first)
+            canvas.Show();
+        if (last || g_unloading)
+            break;
+        if (first) {
+            DwmFlush();
+            first = false;
+            if (job.firstFrame)
+                SetEvent(job.firstFrame);
+        }
+        pacer.Wait(frameStart);
+    }
+}
+
+void Finish(Job const& job) {
+    if (job.rising)
+        SetCloak(job.hwnd, FALSE);
+    SetTransitions(job.hwnd, true);
+    if (job.firstFrame)
+        SetEvent(job.firstFrame);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_active.erase(job.hwnd);
+}
+
+DWORD WINAPI Run(void* param) {
+    std::unique_ptr<Job> job(static_cast<Job*>(param));
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    Plan plan;
+    Canvas canvas;
+    if (MakePlan(*job, plan) && canvas.Create(plan.bounds))
+        Play(*job, plan, canvas);
+    Finish(*job);
+    return 0;
+}
+
+bool Spawn(void* param) {
+    std::lock_guard<std::mutex> lock(g_workersMutex);
+    if (g_unloading)
+        return false;
+    std::erase_if(g_workers, [](HANDLE h) {
+        if (WaitForSingleObject(h, 0) != WAIT_OBJECT_0)
+            return false;
+        CloseHandle(h);
+        return true;
+    });
+    HANDLE thread = CreateThread(nullptr, 0, Run, param, 0, nullptr);
+    if (!thread)
+        return false;
+    g_workers.push_back(thread);
+    return true;
+}
+
+void Sweep() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (auto it = g_snapshots.begin(); it != g_snapshots.end();) {
+        if (IsWindow(it->first)) {
+            ++it;
+            continue;
+        }
+        DeleteObject(it->second.bitmap);
+        it = g_snapshots.erase(it);
+    }
+    std::erase_if(g_iconX, [](auto const& entry) { return !IsWindow(entry.first); });
+}
+
+bool Reserve(HWND hwnd) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return !g_unloading && g_active.insert(hwnd).second;
+}
+
+bool Launch(HWND hwnd, bool rising) {
+    RECT win;
+    if (!GetWindowRect(hwnd, &win))
+        return false;
+    RECT rect = win, frame;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))))
+        rect = frame;
+    int w = rect.right - rect.left, h = rect.bottom - rect.top;
+    int rawW = win.right - win.left, rawH = win.bottom - win.top;
+    if (w <= 0 || h <= 0 || rawW <= 0 || rawH <= 0 || (long long)w * h > kMaxPixels ||
+        (long long)rawW * rawH > kMaxPixels)
+        return false;
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfo(monitor, &mi))
+        return false;
+
+    auto job = std::make_unique<Job>();
+    job->h = h;
+    job->hwnd = hwnd;
+    job->monitor = monitor;
+    job->rect = rect;
+    job->rising = rising;
+    job->w = w;
+    job->dockX = DockX(hwnd, monitor, mi.rcMonitor);
+
+    HDC screen = GetDC(nullptr);
+    if (!screen)
+        return false;
+    job->bitmap = CreateDib(screen, w, h, &job->bits);
+    bool ready = job->bitmap && job->bits;
+    if (ready && rising)
+        ready = TakeCached(*job) || Capture(screen, win, *job);
+    else if (ready) {
+        ready = Capture(screen, win, *job);
+        if (ready)
+            Cache(screen, *job);
+    }
+    ReleaseDC(nullptr, screen);
+    if (!ready)
+        return false;
+
+    HANDLE shown = nullptr;
+    if (!rising) {
+        shown = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        if (shown && !DuplicateHandle(GetCurrentProcess(), shown, GetCurrentProcess(),
+                                      &job->firstFrame, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            job->firstFrame = nullptr;
+    }
+
+    bool wait = shown && job->firstFrame;
+    if (!Spawn(job.get())) {
+        if (shown)
+            CloseHandle(shown);
+        return false;
+    }
+    job.release();
+    if (shown) {
+        if (wait)
+            WaitForSingleObject(shown, kFirstFrameWaitMs);
+        CloseHandle(shown);
+    }
+    return true;
+}
+
+bool Start(HWND hwnd, bool rising) {
+    Sweep();
+    if (!Reserve(hwnd)) {
+        bool owned;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            owned = g_active.count(hwnd) != 0;
+        }
+        if (rising)
+            SetCloak(hwnd, FALSE);
+        if (!owned)
+            SetTransitions(hwnd, true);
+        return false;
+    }
+    if (Launch(hwnd, rising))
+        return true;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_active.erase(hwnd);
+    }
+    Revert(hwnd, rising);
+    return false;
+}
+
+void Minimize(HWND hwnd) {
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || !ShouldAnimate(hwnd))
+        return;
+    SetTransitions(hwnd, false);
+    Start(hwnd, false);
+}
+
+template <typename F>
+auto Restore(HWND hwnd, F&& call) {
+    if (!IsIconic(hwnd) || !ShouldAnimate(hwnd))
+        return call();
+    SetTransitions(hwnd, false);
+    SetCloak(hwnd, TRUE);
+    auto result = call();
+    Start(hwnd, true);
+    return result;
+}
+
+bool IsMinimize(int cmd) {
+    return cmd == SW_MINIMIZE || cmd == SW_SHOWMINIMIZED || cmd == SW_SHOWMINNOACTIVE;
+}
+
+void Forget(HWND hwnd) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (auto it = g_snapshots.find(hwnd); it != g_snapshots.end()) {
+        DeleteObject(it->second.bitmap);
+        g_snapshots.erase(it);
+    }
+    g_iconX.erase(hwnd);
+}
+
+void BeginUnload() {
+    std::lock_guard<std::mutex> lock(g_workersMutex);
+    g_unloading = true;
+}
+
+void Shutdown() {
+    BeginUnload();
+    std::vector<HANDLE> workers;
+    {
+        std::lock_guard<std::mutex> lock(g_workersMutex);
+        workers.swap(g_workers);
+    }
+    for (HANDLE h : workers) {
+        WaitForSingleObject(h, INFINITE);
+        CloseHandle(h);
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (auto& entry : g_snapshots)
+        DeleteObject(entry.second.bitmap);
+    g_snapshots.clear();
+    g_iconX.clear();
+}
+}
+
+using CloseWindow_t = decltype(&CloseWindow);
+CloseWindow_t CloseWindow_Original;
+BOOL WINAPI CloseWindow_Hook(HWND hwnd) {
+    Genie::Minimize(hwnd);
+    return CloseWindow_Original(hwnd);
+}
+
+using DefWindowProcW_t = decltype(&DefWindowProcW);
+DefWindowProcW_t DefWindowProcW_Original;
+LRESULT WINAPI DefWindowProcW_Hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_DESTROY) {
+        Genie::Forget(hwnd);
+    } else if (msg == WM_SYSCOMMAND) {
+        UINT command = wParam & 0xFFF0;
+        if (command == SC_MINIMIZE)
+            Genie::Minimize(hwnd);
+        else if (command == SC_RESTORE)
+            return Genie::Restore(
+                hwnd, [&] { return DefWindowProcW_Original(hwnd, msg, wParam, lParam); });
+    }
+    return DefWindowProcW_Original(hwnd, msg, wParam, lParam);
+}
+
+using SetWindowPlacement_t = decltype(&SetWindowPlacement);
+SetWindowPlacement_t SetWindowPlacement_Original;
+BOOL WINAPI SetWindowPlacement_Hook(HWND hwnd, const WINDOWPLACEMENT* placement) {
+    if (placement && Genie::IsMinimize(placement->showCmd))
+        Genie::Minimize(hwnd);
+    return SetWindowPlacement_Original(hwnd, placement);
+}
+
+using ShowWindow_t = decltype(&ShowWindow);
+ShowWindow_t ShowWindow_Original;
+BOOL WINAPI ShowWindow_Hook(HWND hwnd, int cmd) {
+    if (Genie::IsMinimize(cmd))
+        Genie::Minimize(hwnd);
+    else if (cmd == SW_RESTORE || cmd == SW_SHOWNORMAL)
+        return Genie::Restore(hwnd, [&] { return ShowWindow_Original(hwnd, cmd); });
+    return ShowWindow_Original(hwnd, cmd);
+}
+
+using ShowWindowAsync_t = decltype(&ShowWindowAsync);
+ShowWindowAsync_t ShowWindowAsync_Original;
+BOOL WINAPI ShowWindowAsync_Hook(HWND hwnd, int cmd) {
+    if (Genie::IsMinimize(cmd))
+        Genie::Minimize(hwnd);
+    return ShowWindowAsync_Original(hwnd, cmd);
+}
+
+void HookGenie() {
+    WindhawkUtils::SetFunctionHook(CloseWindow, CloseWindow_Hook, &CloseWindow_Original);
+    WindhawkUtils::SetFunctionHook(DefWindowProcW, DefWindowProcW_Hook, &DefWindowProcW_Original);
+    WindhawkUtils::SetFunctionHook(SetWindowPlacement, SetWindowPlacement_Hook,
+                                   &SetWindowPlacement_Original);
+    WindhawkUtils::SetFunctionHook(ShowWindow, ShowWindow_Hook, &ShowWindow_Original);
+    WindhawkUtils::SetFunctionHook(ShowWindowAsync, ShowWindowAsync_Hook,
+                                   &ShowWindowAsync_Original);
+}
+
+bool g_shellActive = false;
+
+bool IsExplorerProcess() {
+    WCHAR path[MAX_PATH];
+    if (!GetModuleFileName(nullptr, path, ARRAYSIZE(path)))
+        return false;
+    PCWSTR name = wcsrchr(path, L'\\');
+    return name && _wcsicmp(name + 1, L"explorer.exe") == 0;
+}
+
+bool InitShell() {
+    if (!HookTaskbarDllSymbols())
+        return false;
 
     if (HMODULE m = GetTaskbarViewModuleHandle()) {
         g_taskbarViewDllLoaded = true;
         HookTaskbarViewDllSymbols(m);
     } else {
         HMODULE kb = GetModuleHandle(L"kernelbase.dll");
-        auto pLoadLibraryExW = (LoadLibraryExW_t)GetProcAddress(kb, "LoadLibraryExW");
-        WindhawkUtils::SetFunctionHook(pLoadLibraryExW, LoadLibraryExW_Hook,
-                                       &LoadLibraryExW_Original);
+        auto pLoadLibraryExW =
+            kb ? (LoadLibraryExW_t)GetProcAddress(kb, "LoadLibraryExW") : nullptr;
+        if (pLoadLibraryExW)
+            WindhawkUtils::SetFunctionHook(pLoadLibraryExW, LoadLibraryExW_Hook,
+                                           &LoadLibraryExW_Original);
     }
+    return true;
+}
+
+BOOL Wh_ModInit() {
+    HookGenie();
+    g_shellActive = IsExplorerProcess() && InitShell();
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
+    if (!g_shellActive)
+        return;
     if (!g_taskbarViewDllLoaded) {
         if (HMODULE m = GetTaskbarViewModuleHandle()) {
             if (!g_taskbarViewDllLoaded.exchange(true)) {
@@ -1769,10 +2697,13 @@ void Wh_ModAfterInit() {
 }
 
 void Wh_ModBeforeUninit() {
-    g_unloading = true;
+    Genie::BeginUnload();
+    if (!g_shellActive)
+        return;
     TopBar::Stop();
     RunOnTaskbarThread();
 }
 
 void Wh_ModUninit() {
+    Genie::Shutdown();
 }
