@@ -6,7 +6,7 @@
 // @author          Muhammad Sabih
 // @include         *
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lgdi32 -luser32 -lgdiplus -lshell32 -ladvapi32 -ldwmapi -luuid -lwlanapi
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lgdi32 -luser32 -lgdiplus -lshell32 -ladvapi32 -ldwmapi -luuid -luxtheme -lwlanapi
 // ==/WindhawkMod==
 
 // ==WindhawkModSettings==
@@ -27,10 +27,13 @@
 #include <gdiplus.h>
 #include <shellapi.h>
 #include <uiautomation.h>
+#include <uxtheme.h>
+#include <vssym32.h>
 #include <windowsx.h>
 #include <wlanapi.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -53,6 +56,12 @@
 #endif
 #ifndef DWMWA_EXTENDED_FRAME_BOUNDS
 #define DWMWA_EXTENDED_FRAME_BOUNDS 9
+#endif
+#ifndef DWMWA_SYSTEMBACKDROP_TYPE
+#define DWMWA_SYSTEMBACKDROP_TYPE 38
+#endif
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 #ifndef DWMWA_WINDOW_CORNER_PREFERENCE
 #define DWMWA_WINDOW_CORNER_PREFERENCE 33
@@ -884,6 +893,666 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 PCWSTR BaseName(PCWSTR path) {
     PCWSTR name = wcsrchr(path, L'\\');
     return name ? name + 1 : path;
+}
+
+namespace Translucency {
+struct Saved {
+    int backdrop = DWMSBT_AUTO;
+    MARGINS margins{};
+};
+
+constexpr WCHAR kAppliedProp[] = L"MinimalistTranslucent";
+constexpr int kBackdropAcrylic = DWMSBT_TRANSIENTWINDOW;
+constexpr WCHAR kPersonalizeKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+
+using DrawTextWithGlow_t = HRESULT(WINAPI*)(HDC, LPWSTR, UINT, RECT*, DWORD, COLORREF, COLORREF,
+                                            UINT, UINT, BOOL, DTT_CALLBACK_PROC, LPARAM);
+using DrawThemeBackground_t = decltype(&DrawThemeBackground);
+using DrawThemeBackgroundEx_t = decltype(&DrawThemeBackgroundEx);
+using DrawThemeText_t = decltype(&DrawThemeText);
+using DrawThemeTextEx_t = decltype(&DrawThemeTextEx);
+using DwmExtendFrameIntoClientArea_t = decltype(&DwmExtendFrameIntoClientArea);
+using DwmSetWindowAttribute_t = decltype(&DwmSetWindowAttribute);
+using ExtTextOutW_t = decltype(&ExtTextOutW);
+using FillRect_t = decltype(&FillRect);
+using GetSysColor_t = decltype(&GetSysColor);
+using GetSysColorBrush_t = decltype(&GetSysColorBrush);
+using GetThemeColor_t = decltype(&GetThemeColor);
+using NtUserCreateWindowEx_t = HWND(WINAPI*)(DWORD, PVOID, LPCWSTR, PVOID, DWORD, LONG, LONG,
+                                             LONG, LONG, HWND, HMENU, HINSTANCE, LPVOID, DWORD,
+                                             DWORD, DWORD, VOID*);
+
+DrawTextWithGlow_t DrawTextWithGlow_Original;
+DrawThemeBackground_t DrawThemeBackground_Original;
+DrawThemeBackgroundEx_t DrawThemeBackgroundEx_Original;
+DrawThemeText_t DrawThemeText_Original;
+DrawThemeTextEx_t DrawThemeTextEx_Original;
+DwmExtendFrameIntoClientArea_t DwmExtendFrameIntoClientArea_Original;
+DwmSetWindowAttribute_t DwmSetWindowAttribute_Original;
+ExtTextOutW_t ExtTextOutW_Original;
+FillRect_t FillRect_Original;
+GetSysColor_t GetSysColor_Original;
+GetSysColorBrush_t GetSysColorBrush_Original;
+GetThemeColor_t GetThemeColor_Original;
+NtUserCreateWindowEx_t NtUserCreateWindowEx_Original;
+
+std::array<HBRUSH, COLOR_MENUBAR + 1> g_brushes{};
+std::mutex g_brushMutex;
+std::atomic<bool> g_dark{false};
+bool g_explorer = false;
+std::unordered_map<HWND, Saved> g_saved;
+std::mutex g_savedMutex;
+
+std::array<BYTE, 256> BuildTextGamma() {
+    std::array<BYTE, 256> lut{};
+    for (int i = 0; i < 256; i++) {
+        float a = i / 255.0f;
+        lut[i] = (BYTE)(std::pow(a, 1.0f / (1.2f + 0.3f * a)) * 255.0f + 0.5f);
+    }
+    return lut;
+}
+
+std::array<BYTE, 256> const g_textGamma = BuildTextGamma();
+
+bool HasClass(HWND hwnd, std::initializer_list<PCWSTR> classes) {
+    WCHAR cls[64]{};
+    if (!hwnd || !GetClassName(hwnd, cls, ARRAYSIZE(cls)))
+        return false;
+    for (PCWSTR name : classes) {
+        if (wcscmp(cls, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool IsApplied(HWND hwnd) {
+    return hwnd && GetProp(hwnd, kAppliedProp);
+}
+
+bool IsCloaked(HWND hwnd) {
+    BOOL cloaked = FALSE;
+    return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) &&
+           cloaked;
+}
+
+bool IsDarkMode() {
+    DWORD value = 1, size = sizeof(value);
+    RegGetValueW(HKEY_CURRENT_USER, kPersonalizeKey, L"AppsUseLightTheme", RRF_RT_REG_DWORD,
+                 nullptr, &value, &size);
+    return value == 0;
+}
+
+bool IsSurface(HWND hwnd) {
+    return HasClass(hwnd, {L"#32768", L"DropDown", L"ViewControlClass", L"tooltips_class32"});
+}
+
+bool IsGlassWindow(HWND hwnd) {
+    if (!g_explorer || GetAncestor(hwnd, GA_PARENT) != GetDesktopWindow() ||
+        HasClass(hwnd, {L"Progman", L"Shell_SecondaryTrayWnd", L"Shell_TrayWnd", L"WorkerW"}))
+        return false;
+    LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if ((exStyle & (WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)) ||
+        (IsCloaked(hwnd) && !HasClass(hwnd, {L"ApplicationFrameWindow"})) ||
+        (!IsWindowEnabled(hwnd) && !IsWindowVisible(hwnd)))
+        return false;
+    if ((style & WS_POPUPWINDOW) == WS_POPUPWINDOW ||
+        (style & WS_OVERLAPPEDWINDOW) == WS_OVERLAPPEDWINDOW || (exStyle & WS_EX_DLGMODALFRAME))
+        return true;
+    return (style & WS_CAPTION) == WS_CAPTION && (style & WS_SYSMENU) &&
+           (style & (WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME));
+}
+
+std::wstring ThemeClass(HTHEME theme) {
+    using GetClass_t = HRESULT(WINAPI*)(HTHEME, LPWSTR, int);
+    static auto getClass =
+        (GetClass_t)GetProcAddress(GetModuleHandle(L"uxtheme.dll"), MAKEINTRESOURCEA(74));
+    WCHAR name[255]{};
+    if (!getClass || FAILED(getClass(theme, name, ARRAYSIZE(name))))
+        return {};
+    return name;
+}
+
+HRESULT ExtendFrame(HWND hwnd, MARGINS const& margins) {
+    auto extend = DwmExtendFrameIntoClientArea_Original ? DwmExtendFrameIntoClientArea_Original
+                                                        : DwmExtendFrameIntoClientArea;
+    return extend(hwnd, &margins);
+}
+
+bool IsGlassDC(HDC hdc) {
+    HWND hwnd = WindowFromDC(hdc);
+    return !hwnd || IsApplied(GetAncestor(hwnd, GA_ROOT));
+}
+
+void Refresh(HWND root) {
+    EnumChildWindows(
+        root,
+        [](HWND hwnd, LPARAM) -> BOOL {
+            PostMessage(hwnd, WM_SYSCOLORCHANGE, 0, 0);
+            PostMessage(hwnd, WM_THEMECHANGED, 0, 0);
+            return TRUE;
+        },
+        0);
+    PostMessage(root, WM_SYSCOLORCHANGE, 0, 0);
+    PostMessage(root, WM_THEMECHANGED, 0, 0);
+    RedrawWindow(root, nullptr, nullptr,
+                 RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME | RDW_INVALIDATE);
+}
+
+HRESULT SetAttribute(HWND hwnd, DWORD attribute, int value) {
+    auto set = DwmSetWindowAttribute_Original ? DwmSetWindowAttribute_Original
+                                              : DwmSetWindowAttribute;
+    return set(hwnd, attribute, &value, sizeof(value));
+}
+
+void ApplySurface(HWND hwnd) {
+    if (g_unloading || IsApplied(hwnd))
+        return;
+    SetProp(hwnd, kAppliedProp, (HANDLE)1);
+    if (g_dark)
+        SetAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, TRUE);
+    DWM_BLURBEHIND blur{DWM_BB_ENABLE | DWM_BB_BLURREGION | DWM_BB_TRANSITIONONMAXIMIZED, TRUE,
+                        CreateRectRgn(0, 0, -1, -1), TRUE};
+    DwmEnableBlurBehindWindow(hwnd, &blur);
+    DeleteObject(blur.hRgnBlur);
+    DefWindowProcW(hwnd, WM_NCACTIVATE, TRUE, 0);
+    SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, kBackdropAcrylic);
+    SetAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND);
+}
+
+void ApplyWindow(HWND hwnd) {
+    if (g_unloading || IsApplied(hwnd))
+        return;
+    SetProp(hwnd, kAppliedProp, (HANDLE)1);
+    int backdrop = DWMSBT_AUTO;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop,
+                                        sizeof(backdrop)))) {
+        std::lock_guard<std::mutex> lock(g_savedMutex);
+        g_saved[hwnd].backdrop = backdrop;
+    }
+    if (g_dark)
+        SetAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, TRUE);
+    SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, kBackdropAcrylic);
+    ExtendFrame(hwnd, {-1, -1, -1, -1});
+}
+
+void Apply(HWND hwnd) {
+    if (IsSurface(hwnd))
+        ApplySurface(hwnd);
+    else if (IsGlassWindow(hwnd))
+        ApplyWindow(hwnd);
+}
+
+void Restore(HWND hwnd) {
+    if (!IsApplied(hwnd))
+        return;
+    RemoveProp(hwnd, kAppliedProp);
+    if (IsSurface(hwnd)) {
+        DWM_BLURBEHIND blur{DWM_BB_ENABLE, FALSE, nullptr, FALSE};
+        DwmEnableBlurBehindWindow(hwnd, &blur);
+        SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_NONE);
+        return;
+    }
+    Saved saved;
+    {
+        std::lock_guard<std::mutex> lock(g_savedMutex);
+        if (auto it = g_saved.find(hwnd); it != g_saved.end())
+            saved = it->second;
+    }
+    SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, saved.backdrop);
+    ExtendFrame(hwnd, saved.margins);
+    Refresh(hwnd);
+}
+
+COLORREF GlassSysColor(int index) {
+    switch (index) {
+        case COLOR_BACKGROUND:
+        case COLOR_BTNFACE:
+        case COLOR_INACTIVEBORDER:
+        case COLOR_INFOBK:
+        case COLOR_MENU:
+        case COLOR_MENUBAR:
+        case COLOR_SCROLLBAR:
+        case COLOR_WINDOW:
+            return RGB(0, 0, 0);
+        case COLOR_3DLIGHT:
+            return RGB(4, 4, 4);
+        case COLOR_APPWORKSPACE:
+            return RGB(8, 8, 8);
+        case COLOR_3DDKSHADOW:
+            return RGB(16, 16, 16);
+        case COLOR_ACTIVEBORDER:
+        case COLOR_BTNSHADOW:
+            return RGB(32, 32, 32);
+        case COLOR_BTNHIGHLIGHT:
+            return RGB(64, 64, 64);
+        case COLOR_WINDOWFRAME:
+            return RGB(96, 96, 96);
+    }
+    if (!g_dark)
+        return GetSysColor_Original(index);
+    switch (index) {
+        case COLOR_GRAYTEXT:
+            return RGB(128, 128, 128);
+        case COLOR_INACTIVECAPTIONTEXT:
+            return RGB(160, 160, 160);
+        case COLOR_WINDOWTEXT:
+            return RGB(240, 240, 240);
+        case COLOR_BTNTEXT:
+        case COLOR_CAPTIONTEXT:
+        case COLOR_HIGHLIGHTTEXT:
+        case COLOR_INFOTEXT:
+        case COLOR_MENUTEXT:
+            return RGB(255, 255, 255);
+    }
+    return GetSysColor_Original(index);
+}
+
+bool IsClearPart(std::wstring const& theme, int part, int state) {
+    if (theme == L"Menu")
+        return part == MENU_POPUPBACKGROUND || part == MENU_POPUPBORDERS ||
+               part == MENU_POPUPGUTTER || part == MENU_POPUPCHECKBACKGROUND ||
+               ((part == MENU_POPUPITEM || part == 27) && state != MPI_HOT) ||
+               (g_explorer && (part == MENU_BARBACKGROUND ||
+                               (part == MENU_BARITEM && state == MBI_NORMAL)));
+    if (theme == L"Tooltip")
+        return part == TTP_STANDARD || part == TTP_BALLOON || (g_explorer && part == TTP_BALLOONSTEM);
+    if (!g_explorer)
+        return false;
+    if (theme == L"AeroWizard")
+        return part == AW_TITLEBAR || part == AW_HEADERAREA || part == AW_CONTENTAREA ||
+               part == AW_COMMANDAREA;
+    if (theme == L"CommandModule")
+        return part == 1 && state == 0;
+    if (theme == L"CommonItemsDialog" || theme == L"PreviewPane")
+        return part == 1;
+    if (theme == L"ControlPanel")
+        return part == CPANEL_CONTENTPANE || part == CPANEL_CONTENTPANELINE ||
+               part == CPANEL_BANNERAREA || part == CPANEL_LARGECOMMANDAREA ||
+               part == CPANEL_SMALLCOMMANDAREA;
+    if (theme == L"Header")
+        return part == 0 || (part == HP_HEADERITEM && (state == HIS_NORMAL ||
+                                                       state == HIS_SORTEDNORMAL ||
+                                                       state == HIS_ICONNORMAL));
+    if (theme == L"Rebar")
+        return (part == RP_BAND || part == RP_BACKGROUND) && state == 0;
+    if (theme == L"Status")
+        return part == 0;
+    if (theme == L"Tab")
+        return part == TABP_PANE;
+    if (theme == L"TaskDialog")
+        return part == TDLG_PRIMARYPANEL ||
+               ((part == TDLG_CONTENTPANE || part == TDLG_FOOTNOTEPANE ||
+                 part == TDLG_FOOTNOTESEPARATOR || part == TDLG_SECONDARYPANEL) &&
+                state == 0);
+    return false;
+}
+
+bool ExplorerThemeColor(std::wstring const& theme, int part, int state, int prop, HRESULT hr,
+                        COLORREF* color) {
+    bool dark = g_dark;
+    bool groupHeader = theme == L"ListView" && part == LVP_GROUPHEADER;
+    if (prop == TMT_TEXTCOLOR) {
+        if (FAILED(hr))
+            return false;
+        bool grey = *color == 0x006D6D6D;
+        int luma = (GetRValue(*color) * 2 + GetGValue(*color) * 5 + GetBValue(*color)) / 8;
+        if (!dark && grey && theme == L"ItemsView" && ((part == 4 && state == 1) || part == 5))
+            *color = RGB(0, 0, 0);
+        else if (!dark && grey && theme == L"ListView" && part == LVP_LISTITEM)
+            *color = RGB(0, 0, 0);
+        else if (dark && (groupHeader || theme == L"Header" || theme == L"PreviewPane" ||
+                          luma < 96))
+            *color = RGB(255, 255, 255);
+        return true;
+    }
+    if (groupHeader) {
+        if (dark)
+            *color = RGB(255, 255, 255);
+        return true;
+    }
+    if (theme == L"PreviewPane" && prop == TMT_FILLCOLOR && part >= 5 && part <= 7) {
+        *color = part == 6 ? RGB(192, 192, 192) : RGB(255, 255, 255);
+        return true;
+    }
+    if (prop == TMT_FILLCOLOR || prop == TMT_FILLCOLORHINT) {
+        *color = RGB(0, 0, 0);
+        return true;
+    }
+    return false;
+}
+
+bool IsNearBlack(HBRUSH brush) {
+    LOGBRUSH info{};
+    if (!GetObject(brush, sizeof(info), &info) || info.lbStyle != BS_SOLID)
+        return false;
+    return GetRValue(info.lbColor) <= 0x20 && GetGValue(info.lbColor) <= 0x20 &&
+           GetBValue(info.lbColor) <= 0x20;
+}
+
+bool ShouldComposeText(HDC hdc, UINT options, LPCRECT rect, LPCWSTR text, UINT count) {
+    if (!hdc || !text || !count || !options || (GetTextAlign(hdc) & TA_UPDATECP) ||
+        ((options & (ETO_OPAQUE | ETO_CLIPPED)) && (!rect || IsRectEmpty(rect))))
+        return false;
+    return IsGlassDC(hdc);
+}
+
+bool TextBounds(HDC hdc, POINT point, UINT options, LPCRECT clip, LPCWSTR text, UINT count,
+                INT const* dx, RECT& bounds) {
+    SIZE size{};
+    if (!((options & ETO_GLYPH_INDEX) ? GetTextExtentPointI(hdc, (WORD*)text, count, &size)
+                                      : GetTextExtentPoint32W(hdc, text, count, &size)))
+        return false;
+    if (dx) {
+        int width = 0, height = 0;
+        UINT stride = (options & ETO_PDY) ? 2 : 1;
+        for (UINT i = 0; i < count; i++) {
+            width += dx[i * stride];
+            if (options & ETO_PDY)
+                height += dx[i * stride + 1];
+        }
+        size.cx = std::max<LONG>(size.cx, width);
+        size.cy += std::abs(height);
+    }
+    UINT align = GetTextAlign(hdc);
+    UINT vertical = align & (TA_BOTTOM | TA_BASELINE);
+    UINT horizontal = align & (TA_RIGHT | TA_CENTER);
+    TEXTMETRIC metrics;
+    if (vertical == TA_BASELINE && GetTextMetrics(hdc, &metrics))
+        point.y -= metrics.tmAscent;
+    else if (vertical == TA_BOTTOM)
+        point.y -= size.cy;
+    if (horizontal == TA_CENTER)
+        point.x -= size.cx / 2;
+    else if (horizontal == TA_RIGHT)
+        point.x -= size.cx;
+    SetRect(&bounds, point.x, point.y, point.x + size.cx, point.y + size.cy);
+    if (clip && (options & ETO_CLIPPED))
+        IntersectRect(&bounds, &bounds, clip);
+    if (clip && (options & ETO_OPAQUE))
+        UnionRect(&bounds, &bounds, clip);
+    return !IsRectEmpty(&bounds);
+}
+
+bool PaintTextBackground(HDC hdc, LPCRECT rect, UINT options) {
+    if (!(options & ETO_OPAQUE))
+        return true;
+    if (GetBkColor(hdc) != GetSysColor(COLOR_HIGHLIGHT)) {
+        HBRUSH brush = CreateSolidBrush(GetBkColor(hdc));
+        FillRect(hdc, rect, brush);
+        DeleteObject(brush);
+        return true;
+    }
+    BP_PAINTPARAMS params{sizeof(params)};
+    HDC memDC = nullptr;
+    HPAINTBUFFER buffer = BeginBufferedPaint(hdc, rect, BPBF_TOPDOWNDIB, &params, &memDC);
+    if (!buffer)
+        return false;
+    FillRect(memDC, rect, GetSysColorBrush(COLOR_HIGHLIGHT));
+    BufferedPaintMakeOpaque(buffer, rect);
+    return SUCCEEDED(EndBufferedPaint(buffer, TRUE));
+}
+
+bool ComposeText(HDC hdc, HPAINTBUFFER buffer, RECT const& bounds) {
+    RGBQUAD* pixels = nullptr;
+    int stride = 0;
+    if (FAILED(GetBufferedPaintBits(buffer, &pixels, &stride))) {
+        EndBufferedPaint(buffer, FALSE);
+        return false;
+    }
+    COLORREF color = GetTextColor(hdc);
+    BYTE red = GetRValue(color), green = GetGValue(color), blue = GetBValue(color);
+    for (int y = 0; y < bounds.bottom - bounds.top; y++) {
+        RGBQUAD* row = pixels + y * stride;
+        for (int x = 0; x < bounds.right - bounds.left; x++) {
+            RGBQUAD& px = row[x];
+            if ((px.rgbBlue | px.rgbGreen | px.rgbRed) == 0)
+                continue;
+            BYTE alpha = g_textGamma[(px.rgbBlue + (px.rgbGreen << 1) + px.rgbRed) >> 2];
+            px.rgbBlue = (BYTE)((blue * alpha) >> 8);
+            px.rgbGreen = (BYTE)((green * alpha) >> 8);
+            px.rgbRed = (BYTE)((red * alpha) >> 8);
+            px.rgbReserved = alpha;
+        }
+    }
+    return true;
+}
+
+HRESULT WINAPI DrawTextWithGlow_Hook(HDC hdc, LPWSTR text, UINT count, RECT* rect, DWORD flags,
+                                     COLORREF textColor, COLORREF glowColor, UINT glowRadius,
+                                     UINT glowIntensity, BOOL premultiply,
+                                     DTT_CALLBACK_PROC callback, LPARAM param) {
+    bool empty = rect->right == rect->left || rect->bottom == rect->top;
+    if (glowRadius > 0 || (empty && !(flags & DT_CALCRECT)))
+        return DrawTextWithGlow_Original(hdc, text, count, rect, flags, textColor, glowColor,
+                                         glowRadius, glowIntensity, premultiply, callback, param);
+    SetTextColor(hdc, textColor);
+    SetBkColor(hdc, RGB(0, 0, 0));
+    if (callback)
+        return callback(hdc, text, count, rect, flags, param);
+    return DrawTextW(hdc, text, count, rect, flags & ~DT_MODIFYSTRING) ? S_OK : E_FAIL;
+}
+
+HRESULT WINAPI DrawThemeBackground_Hook(HTHEME theme, HDC hdc, int part, int state,
+                                        LPCRECT rect, LPCRECT clip) {
+    if (!g_unloading && rect && IsClearPart(ThemeClass(theme), part, state)) {
+        RECT area = *rect;
+        if (clip)
+            IntersectRect(&area, rect, clip);
+        if (HWND hwnd = WindowFromDC(hdc); hwnd && IsSurface(hwnd))
+            ApplySurface(hwnd);
+        FillRect(hdc, &area, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        return S_OK;
+    }
+    return DrawThemeBackground_Original(theme, hdc, part, state, rect, clip);
+}
+
+HRESULT WINAPI DrawThemeBackgroundEx_Hook(HTHEME theme, HDC hdc, int part, int state,
+                                          LPCRECT rect, DTBGOPTS const* options) {
+    if (!g_unloading && rect && IsClearPart(ThemeClass(theme), part, state)) {
+        RECT area = *rect;
+        if (options && (options->dwFlags & DTBG_CLIPRECT))
+            IntersectRect(&area, rect, &options->rcClip);
+        FillRect(hdc, &area, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        return S_OK;
+    }
+    return DrawThemeBackgroundEx_Original(theme, hdc, part, state, rect, options);
+}
+
+HRESULT WINAPI DrawThemeTextEx_Hook(HTHEME theme, HDC hdc, int part, int state, LPCWSTR text,
+                                    int count, DWORD flags, LPRECT rect, DTTOPTS const* options) {
+    if (g_unloading || (options && (options->dwFlags & DTT_CALCRECT)))
+        return DrawThemeTextEx_Original(theme, hdc, part, state, text, count, flags, rect,
+                                        options);
+    DTTOPTS themed = options ? *options : DTTOPTS{sizeof(DTTOPTS)};
+    if (SUCCEEDED(GetThemeColor(theme, part, state, TMT_TEXTCOLOR, &themed.crText)))
+        themed.dwFlags |= DTT_TEXTCOLOR;
+    return DrawThemeTextEx_Original(theme, hdc, part, state, text, count, flags, rect, &themed);
+}
+
+HRESULT WINAPI DrawThemeText_Hook(HTHEME theme, HDC hdc, int part, int state, LPCWSTR text,
+                                  int count, DWORD flags, DWORD, LPCRECT rect) {
+    RECT area = *rect;
+    return DrawThemeTextEx_Hook(theme, hdc, part, state, text, count, flags, &area, nullptr);
+}
+
+HRESULT WINAPI DwmExtendFrameIntoClientArea_Hook(HWND hwnd, MARGINS const* margins) {
+    if (g_unloading || !margins || !IsApplied(hwnd) || IsSurface(hwnd))
+        return DwmExtendFrameIntoClientArea_Original(hwnd, margins);
+    {
+        std::lock_guard<std::mutex> lock(g_savedMutex);
+        g_saved[hwnd].margins = *margins;
+    }
+    return ExtendFrame(hwnd, {-1, -1, -1, -1});
+}
+
+HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd, DWORD attribute, LPCVOID value,
+                                          DWORD size) {
+    if (g_unloading || !IsApplied(hwnd) ||
+        (attribute != DWMWA_SYSTEMBACKDROP_TYPE && attribute != DWMWA_USE_HOSTBACKDROPBRUSH))
+        return DwmSetWindowAttribute_Original(hwnd, attribute, value, size);
+    if (attribute == DWMWA_SYSTEMBACKDROP_TYPE && value && size >= sizeof(int)) {
+        std::lock_guard<std::mutex> lock(g_savedMutex);
+        g_saved[hwnd].backdrop = *(int const*)value;
+    }
+    return SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, kBackdropAcrylic);
+}
+
+BOOL WINAPI ExtTextOutW_Hook(HDC hdc, int x, int y, UINT options, RECT const* rect,
+                             LPCWSTR text, UINT count, INT const* dx) {
+    RECT bounds{};
+    if (g_unloading || !ShouldComposeText(hdc, options, rect, text, count) ||
+        !TextBounds(hdc, {x, y}, options, rect, text, count, dx, bounds) ||
+        !PaintTextBackground(hdc, rect, options))
+        return ExtTextOutW_Original(hdc, x, y, options, rect, text, count, dx);
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    BP_PAINTPARAMS params{sizeof(params), BPPF_ERASE | BPPF_NOCLIP, nullptr, &blend};
+    HDC memDC = nullptr;
+    HPAINTBUFFER buffer = BeginBufferedPaint(hdc, &bounds, BPBF_TOPDOWNDIB, &params, &memDC);
+    if (!buffer)
+        return ExtTextOutW_Original(hdc, x, y, options, rect, text, count, dx);
+    SelectObject(memDC, GetCurrentObject(hdc, OBJ_FONT));
+    SetTextAlign(memDC, GetTextAlign(hdc));
+    SetLayout(memDC, GetLayout(hdc));
+    SetBkMode(memDC, TRANSPARENT);
+    SetTextColor(memDC, RGB(255, 255, 255));
+    BOOL result = ExtTextOutW_Original(memDC, x, y, options & ~ETO_OPAQUE, rect, text, count, dx);
+    if (!ComposeText(hdc, buffer, bounds) || FAILED(EndBufferedPaint(buffer, TRUE)))
+        return ExtTextOutW_Original(hdc, x, y, options, rect, text, count, dx);
+    return result;
+}
+
+BOOL WINAPI FillRect_Hook(HDC hdc, RECT const* rect, HBRUSH brush) {
+    if (g_unloading)
+        return FillRect_Original(hdc, rect, brush);
+    ULONG_PTR index = (ULONG_PTR)brush - 1;
+    if (index <= COLOR_MENUBAR)
+        brush = GetSysColorBrush((int)index);
+    else if (IsNearBlack(brush) && IsGlassDC(hdc))
+        brush = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    return FillRect_Original(hdc, rect, brush);
+}
+
+DWORD WINAPI GetSysColor_Hook(int index) {
+    return g_unloading ? GetSysColor_Original(index) : GlassSysColor(index);
+}
+
+HBRUSH WINAPI GetSysColorBrush_Hook(int index) {
+    if (g_unloading || index < 0 || index > COLOR_MENUBAR)
+        return GetSysColorBrush_Original(index);
+    std::lock_guard<std::mutex> lock(g_brushMutex);
+    HBRUSH& brush = g_brushes[index];
+    if (!brush || GetObjectType(brush) != OBJ_BRUSH)
+        brush = CreateSolidBrush(GlassSysColor(index));
+    return brush;
+}
+
+HRESULT WINAPI GetThemeColor_Hook(HTHEME theme, int part, int state, int prop, COLORREF* color) {
+    HRESULT hr = GetThemeColor_Original(theme, part, state, prop, color);
+    if (g_unloading || !color)
+        return hr;
+    std::wstring name = ThemeClass(theme);
+    if (name == L"Menu" || name == L"Tooltip") {
+        bool text = prop == TMT_TEXTCOLOR &&
+                    (name == L"Tooltip" ? part == TTP_STANDARD || part == TTP_BALLOON
+                                        : (part == MENU_POPUPITEM || part == 27 ||
+                                           (g_explorer && part == MENU_BARITEM)) &&
+                                              state != MPI_DISABLED && state != MPI_DISABLEDHOT);
+        if (text && g_dark)
+            *color = RGB(255, 255, 255);
+        else if (name == L"Menu" && (prop == TMT_FILLCOLOR || prop == TMT_FILLCOLORHINT))
+            *color = RGB(0, 0, 0);
+        else
+            return hr;
+        return S_OK;
+    }
+    if (g_explorer && ExplorerThemeColor(name, part, state, prop, hr, color))
+        return S_OK;
+    return hr;
+}
+
+HWND WINAPI NtUserCreateWindowEx_Hook(DWORD exStyle, PVOID className, LPCWSTR versionedClass,
+                                      PVOID windowName, DWORD style, LONG x, LONG y, LONG w,
+                                      LONG h, HWND parent, HMENU menu, HINSTANCE instance,
+                                      LPVOID param, DWORD showMode, DWORD unknown1,
+                                      DWORD unknown2, VOID* unknown3) {
+    HWND hwnd = NtUserCreateWindowEx_Original(exStyle, className, versionedClass, windowName,
+                                              style, x, y, w, h, parent, menu, instance, param,
+                                              showMode, unknown1, unknown2, unknown3);
+    if (hwnd && !g_unloading)
+        Apply(hwnd);
+    return hwnd;
+}
+
+void ApplyExisting() {
+    EnumWindows(
+        [](HWND hwnd, LPARAM) -> BOOL {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid == GetCurrentProcessId() && !IsApplied(hwnd)) {
+                Apply(hwnd);
+                if (IsApplied(hwnd) && !IsSurface(hwnd))
+                    Refresh(hwnd);
+            }
+            return TRUE;
+        },
+        0);
+}
+
+void Install(bool explorer) {
+    g_dark = IsDarkMode();
+    g_explorer = explorer;
+    if (auto create = (NtUserCreateWindowEx_t)GetProcAddress(GetModuleHandle(L"win32u.dll"),
+                                                             "NtUserCreateWindowEx"))
+        WindhawkUtils::SetFunctionHook(create, NtUserCreateWindowEx_Hook,
+                                       &NtUserCreateWindowEx_Original);
+    WindhawkUtils::SetFunctionHook(DrawThemeBackground, DrawThemeBackground_Hook,
+                                   &DrawThemeBackground_Original);
+    WindhawkUtils::SetFunctionHook(GetThemeColor, GetThemeColor_Hook, &GetThemeColor_Original);
+    if (!explorer)
+        return;
+    if (auto glow = (DrawTextWithGlow_t)GetProcAddress(GetModuleHandle(L"uxtheme.dll"),
+                                                       MAKEINTRESOURCEA(126)))
+        WindhawkUtils::SetFunctionHook(glow, DrawTextWithGlow_Hook, &DrawTextWithGlow_Original);
+    WindhawkUtils::SetFunctionHook(DrawThemeBackgroundEx, DrawThemeBackgroundEx_Hook,
+                                   &DrawThemeBackgroundEx_Original);
+    WindhawkUtils::SetFunctionHook(DrawThemeText, DrawThemeText_Hook, &DrawThemeText_Original);
+    WindhawkUtils::SetFunctionHook(DrawThemeTextEx, DrawThemeTextEx_Hook,
+                                   &DrawThemeTextEx_Original);
+    WindhawkUtils::SetFunctionHook(DwmExtendFrameIntoClientArea,
+                                   DwmExtendFrameIntoClientArea_Hook,
+                                   &DwmExtendFrameIntoClientArea_Original);
+    WindhawkUtils::SetFunctionHook(DwmSetWindowAttribute, DwmSetWindowAttribute_Hook,
+                                   &DwmSetWindowAttribute_Original);
+    WindhawkUtils::SetFunctionHook(ExtTextOutW, ExtTextOutW_Hook, &ExtTextOutW_Original);
+    WindhawkUtils::SetFunctionHook(FillRect, FillRect_Hook, &FillRect_Original);
+    WindhawkUtils::SetFunctionHook(GetSysColor, GetSysColor_Hook, &GetSysColor_Original);
+    WindhawkUtils::SetFunctionHook(GetSysColorBrush, GetSysColorBrush_Hook,
+                                   &GetSysColorBrush_Original);
+}
+
+void RefreshTheme(LPARAM lParam) {
+    if (!lParam || wcscmp((LPCWSTR)lParam, L"ImmersiveColorSet") != 0)
+        return;
+    g_dark = IsDarkMode();
+    std::lock_guard<std::mutex> lock(g_brushMutex);
+    g_brushes.fill(nullptr);
+}
+
+void Uninstall() {
+    EnumWindows(
+        [](HWND hwnd, LPARAM) -> BOOL {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid == GetCurrentProcessId())
+                Restore(hwnd);
+            return TRUE;
+        },
+        0);
+    std::lock_guard<std::mutex> lock(g_savedMutex);
+    g_saved.clear();
+}
 }
 
 namespace TopBar {
@@ -2941,7 +3610,9 @@ BOOL WINAPI CloseWindow_Hook(HWND hwnd) {
 using DefWindowProcW_t = decltype(&DefWindowProcW);
 DefWindowProcW_t DefWindowProcW_Original;
 LRESULT WINAPI DefWindowProcW_Hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == WM_DESTROY) {
+    if (msg == WM_SETTINGCHANGE) {
+        Translucency::RefreshTheme(lParam);
+    } else if (msg == WM_DESTROY) {
         Genie::Forget(hwnd);
     } else if (msg == WM_SYSCOMMAND) {
         UINT command = wParam & 0xFFF0;
@@ -3024,6 +3695,7 @@ void Wh_ModSettingsChanged() {
 
 BOOL Wh_ModInit() {
     HookGenie();
+    Translucency::Install(IsExplorerProcess());
     g_shellActive = IsExplorerProcess() && InitShell();
     if (g_shellActive)
         TopBar::ReloadSettings();
@@ -3031,6 +3703,7 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModAfterInit() {
+    Translucency::ApplyExisting();
     if (!g_shellActive)
         return;
     if (!g_taskbarViewDllLoaded) {
@@ -3056,5 +3729,6 @@ void Wh_ModBeforeUninit() {
 }
 
 void Wh_ModUninit() {
+    Translucency::Uninstall();
     Genie::Shutdown();
 }
