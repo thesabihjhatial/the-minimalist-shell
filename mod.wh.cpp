@@ -13,7 +13,7 @@
 /*
 - showBatteryPercentage: false
   $name: Show battery percentage
-  $description: Shows the charge level as text next to the battery icon in the top bar
+  $description: Shows charge level as text, next to the battery icon in the top bar
 */
 // ==/WindhawkModSettings==
 
@@ -70,7 +70,6 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.UI.Input.h>
-#include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.h>
@@ -882,8 +881,13 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dw
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
+PCWSTR BaseName(PCWSTR path) {
+    PCWSTR name = wcsrchr(path, L'\\');
+    return name ? name + 1 : path;
+}
+
 namespace TopBar {
-enum Action { kNone, kNotifications, kQuickSettings };
+enum Action { kNotifications, kQuickSettings };
 
 struct Item {
     RECT rc;
@@ -897,12 +901,19 @@ bool g_appBar = false;
 bool g_fullscreen = false;
 constexpr UINT kAppBarMsg = WM_APP + 42;
 constexpr WCHAR kClassName[] = L"MinimalistTopBar";
-constexpr WCHAR kRadioKey[] = L"SYSTEM\\CurrentControlSet\\Control\\RadioManagement";
-constexpr UINT kRadioMsg = WM_APP + 43;
+constexpr UINT_PTR kClockTimerId = 3;
+constexpr UINT_PTR kMotionTimerId = 2;
 constexpr GUID kPowerSavingGuid = {
     0xE00958C0, 0xC213, 0x4ACE, {0xAC, 0x77, 0xFE, 0xCC, 0xED, 0x2E, 0xEE, 0xA5}};
+constexpr double kPulseHoldMs = 1000.0;
+constexpr double kPulseInMs = 320.0;
+constexpr double kPulseOutMs = 450.0;
+constexpr double kPulseScale = 1.25;
+constexpr UINT_PTR kPulseTimerId = 4;
+constexpr WCHAR kRadioKey[] = L"SYSTEM\\CurrentControlSet\\Control\\RadioManagement";
+constexpr UINT kRadioMsg = WM_APP + 43;
 constexpr BYTE kVignettePeak = 64;
-enum Edge { kEdgeBottom, kEdgeLeft, kEdgeRight, kEdgeTop };
+enum Edge { kEdgeBottom, kEdgeTop };
 
 struct Vignette {
     HBITMAP bitmap = nullptr;
@@ -947,8 +958,6 @@ void RunAction(Action action) {
             break;
         case kQuickSettings:
             PressKeys({VK_LWIN, 'A'});
-            break;
-        default:
             break;
     }
 }
@@ -1295,9 +1304,12 @@ RadioIcons ReadRadioIcons() {
 std::atomic<bool> g_energySaver{false};
 std::atomic<bool> g_showPercentage{false};
 
+bool HasBattery(SYSTEM_POWER_STATUS const& ps) {
+    return ps.BatteryFlag != 128 && ps.BatteryLifePercent <= 100;
+}
+
 bool SaverActive(SYSTEM_POWER_STATUS const& ps) {
-    return g_energySaver ||
-           (ps.BatteryFlag != 128 && ps.BatteryLifePercent <= 100 && (ps.SystemStatusFlag & 1));
+    return g_energySaver || (HasBattery(ps) && (ps.SystemStatusFlag & 1));
 }
 
 struct PaintKey {
@@ -1340,12 +1352,6 @@ void PresentLayered(HWND hwnd, bool alphaOnly = false);
 std::unique_ptr<Gdiplus::Font> g_clockFont;
 float g_clockFontSize = 0.0f;
 
-constexpr UINT_PTR kClockTimerId = 3;
-constexpr double kPulseHoldMs = 1000.0;
-constexpr double kPulseInMs = 320.0;
-constexpr double kPulseOutMs = 450.0;
-constexpr double kPulseScale = 1.25;
-constexpr UINT_PTR kPulseTimerId = 4;
 double g_batteryScale = 1.0;
 ULONGLONG g_pulseStart = 0;
 
@@ -1416,7 +1422,6 @@ int g_surfaceW = 0, g_surfaceH = 0;
 double g_winAlpha = 1.0;
 double g_winAlphaTarget = 1.0;
 bool g_closing = false;
-constexpr UINT_PTR kMotionTimerId = 2;
 ULONGLONG g_lastMotionTick = 0;
 bool g_motionRunning = false;
 
@@ -1513,21 +1518,13 @@ bool BottomVignetteSuppressed(HWND tray) {
 
 Edge VignetteEdge(RECT const& r) {
     RECT mon = PrimaryMonitorRect();
-    if (r.right - r.left >= r.bottom - r.top)
-        return r.top + r.bottom < mon.top + mon.bottom ? kEdgeTop : kEdgeBottom;
-    return r.left + r.right < mon.left + mon.right ? kEdgeLeft : kEdgeRight;
+    return r.top + r.bottom < mon.top + mon.bottom ? kEdgeTop : kEdgeBottom;
 }
 
 void FillVignette(DWORD* bits, int w, int h, Edge edge) {
-    auto shade = [](int i, int n) { return (DWORD)(kVignettePeak * (i + 1) / n) << 24; };
     for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            DWORD px = edge == kEdgeBottom ? shade(y, h)
-                       : edge == kEdgeTop  ? shade(h - 1 - y, h)
-                       : edge == kEdgeRight ? shade(x, w)
-                                            : shade(w - 1 - x, w);
-            bits[(size_t)y * w + x] = px;
-        }
+        int i = edge == kEdgeTop ? h - 1 - y : y;
+        std::fill_n(bits + (size_t)y * w, w, (DWORD)(kVignettePeak * (i + 1) / h) << 24);
     }
 }
 
@@ -1580,7 +1577,7 @@ void PresentVignette(Vignette& v, HWND anchor, bool (*suppressed)(HWND), bool al
 }
 
 void PresentVignettes(bool alphaOnly = false) {
-    PresentVignette(g_vignetteBottom, FindWindow(L"Shell_TrayWnd", nullptr),
+    PresentVignette(g_vignetteBottom, alphaOnly ? nullptr : FindWindow(L"Shell_TrayWnd", nullptr),
                     BottomVignetteSuppressed, alphaOnly);
     PresentVignette(g_vignetteTop, g_wnd.load(), TopVignetteSuppressed, alphaOnly);
 }
@@ -1601,6 +1598,285 @@ void PresentLayered(HWND hwnd, bool alphaOnly) {
                         ULW_ALPHA);
 }
 
+struct BarState {
+    bool airplane = false;
+    Gdiplus::Color batteryColor = Gdiplus::Color(255, 255, 255, 255);
+    bool bluetooth = false;
+    bool bluetoothConnected = false;
+    bool charging = false;
+    std::wstring dateText;
+    int level = 100;
+    std::wstring percentText;
+    bool showPercentage = false;
+    bool showWired = false;
+    std::wstring timeText;
+    int wifiLevel = 0;
+    bool wired = false;
+};
+
+struct BarLayout {
+    float airplaneL = 0, airplaneW = 0;
+    float batteryL = 0, batteryW = 0;
+    float bluetoothL = 0, bluetoothW = 0;
+    float clockL = 0;
+    float cy = 0;
+    float dateL = 0, dateW = 0;
+    float networkL = 0, networkW = 0;
+    float percentL = 0, percentW = 0;
+    float timeL = 0, timeW = 0;
+    float u = 1.0f;
+};
+
+struct TextStyle {
+    Gdiplus::Font& font;
+    Gdiplus::StringFormat& fmt;
+    Gdiplus::Graphics& g;
+    float h;
+
+    float Measure(std::wstring const& t) const {
+        Gdiplus::RectF box;
+        g.MeasureString(t.c_str(), -1, &font, Gdiplus::PointF(0, 0), &fmt, &box);
+        return box.Width;
+    }
+
+    void Draw(std::wstring const& t, float l, float w, float dy,
+              Gdiplus::Brush const& brush) const {
+        g.DrawString(t.c_str(), -1, &font, Gdiplus::RectF(l, dy, w + 2, h), &fmt, &brush);
+    }
+};
+
+struct DrawContext {
+    Gdiplus::Color color;
+    float dy;
+    Gdiplus::Color faint;
+    Gdiplus::Graphics& g;
+    BarLayout const& layout;
+    BarState const& state;
+    TextStyle const& text;
+};
+
+void RoundRect(Gdiplus::GraphicsPath& path, float x, float y, float w, float h, float r) {
+    r = std::min(r, std::min(w, h) / 2);
+    path.AddArc(x, y, 2 * r, 2 * r, 180, 90);
+    path.AddArc(x + w - 2 * r, y, 2 * r, 2 * r, 270, 90);
+    path.AddArc(x + w - 2 * r, y + h - 2 * r, 2 * r, 2 * r, 0, 90);
+    path.AddArc(x, y + h - 2 * r, 2 * r, 2 * r, 90, 90);
+    path.CloseFigure();
+}
+
+void DrawAirplane(DrawContext const& c) {
+    if (!c.state.airplane)
+        return;
+    BarLayout const& l = c.layout;
+    static const float k[][2] = {
+        {0, -7},     {1.3f, -4},  {1.3f, -1.5f}, {7, 2.5f},  {7, 4},         {1.3f, 2},
+        {1.3f, 5},   {3, 6.5f},   {3, 7.5f},     {0, 6.8f},  {-3, 7.5f},    {-3, 6.5f},
+        {-1.3f, 5},  {-1.3f, 2},  {-7, 4},       {-7, 2.5f}, {-1.3f, -1.5f}, {-1.3f, -4}};
+    float ax = l.airplaneL + l.airplaneW / 2, ay = l.cy + c.dy;
+    Gdiplus::PointF pts[18];
+    for (int i = 0; i < 18; i++)
+        pts[i] = Gdiplus::PointF(ax + k[i][0] * 0.86f * l.u, ay + k[i][1] * 0.86f * l.u);
+    Gdiplus::SolidBrush brush(c.color);
+    c.g.FillPolygon(&brush, pts, 18);
+}
+
+void DrawBattery(DrawContext const& c) {
+    using namespace Gdiplus;
+    Graphics& g = c.g;
+    BarLayout const& l = c.layout;
+    BarState const& s = c.state;
+    float u = l.u, dy = c.dy;
+    SolidBrush faintBrush(c.faint);
+
+    if (g_batteryScale > 1.0001) {
+        float zx = l.batteryL + (l.batteryW - 2.0f * u) / 2, zy = l.cy + dy;
+        g.TranslateTransform(zx, zy);
+        g.ScaleTransform((float)g_batteryScale, (float)g_batteryScale);
+        g.TranslateTransform(-zx, -zy);
+    }
+    float bodyW = l.batteryW - 2.0f * u, bodyH = 11.0f * u;
+    float x = l.batteryL, y = l.cy - bodyH / 2 + dy;
+    GraphicsPath body;
+    RoundRect(body, x, y, bodyW, bodyH, 3.5f * u);
+    g.FillPath(&faintBrush, &body);
+    float inset = 1.5f * u;
+    float fillW = (bodyW - 2 * inset) * s.level / 100.0f;
+    if (fillW > 0) {
+        GraphicsPath fill;
+        RoundRect(fill, x + inset, y + inset, fillW, bodyH - 2 * inset, 2.2f * u);
+        SolidBrush levelBrush(c.color.GetA() == 255 ? s.batteryColor : c.color);
+        g.FillPath(&levelBrush, &fill);
+    }
+    if (s.charging && c.color.GetA() == 255) {
+        float bx = x + bodyW / 2, by = y + bodyH / 2;
+        static const float k[][2] = {{1.3f, -4.2f}, {-2.3f, 0.7f}, {-0.2f, 0.7f},
+                                     {-1.3f, 4.2f}, {2.3f, -0.7f}, {0.2f, -0.7f}};
+        PointF bolt[6];
+        for (int i = 0; i < 6; i++)
+            bolt[i] = PointF(bx + k[i][0] * 1.25f * u, by + k[i][1] * 1.25f * u);
+        Pen boltEdge(Gdiplus::Color(140, 0, 0, 0), 0.8f * u);
+        boltEdge.SetLineJoin(LineJoinRound);
+        SolidBrush boltFill(Gdiplus::Color(255, 255, 255, 255));
+        g.DrawPolygon(&boltEdge, bolt, 6);
+        g.FillPolygon(&boltFill, bolt, 6);
+    }
+    GraphicsPath cap;
+    RoundRect(cap, x + bodyW + 0.7f * u, l.cy - 2.2f * u + dy, 1.3f * u, 4.4f * u, 0.65f * u);
+    g.FillPath(&faintBrush, &cap);
+    g.ResetTransform();
+
+    if (s.showPercentage) {
+        SolidBrush brush(c.color);
+        c.text.Draw(s.percentText, l.percentL, l.percentW, dy, brush);
+    }
+}
+
+void DrawBluetooth(DrawContext const& c) {
+    using namespace Gdiplus;
+    if (!c.state.bluetooth)
+        return;
+    BarLayout const& l = c.layout;
+    float u = l.u;
+    Pen pen(c.state.bluetoothConnected ? c.color : c.faint, 1.4f * u);
+    pen.SetStartCap(LineCapRound);
+    pen.SetEndCap(LineCapRound);
+    pen.SetLineJoin(LineJoinRound);
+    float bx = l.bluetoothL + l.bluetoothW / 2, by = l.cy + c.dy;
+    PointF pts[] = {{bx - 3.4f * u, by - 3.1f * u}, {bx + 3.3f * u, by + 3.1f * u},
+                    {bx, by + 6.0f * u},            {bx, by - 6.0f * u},
+                    {bx + 3.3f * u, by - 3.1f * u}, {bx - 3.4f * u, by + 3.1f * u}};
+    c.g.DrawLines(&pen, pts, 6);
+}
+
+void DrawClock(DrawContext const& c) {
+    Gdiplus::SolidBrush brush(c.color);
+    BarLayout const& l = c.layout;
+    c.text.Draw(c.state.dateText, l.dateL, l.dateW, c.dy, brush);
+    c.text.Draw(c.state.timeText, l.timeL, l.timeW, c.dy, brush);
+}
+
+void DrawNetwork(DrawContext const& c) {
+    using namespace Gdiplus;
+    BarState const& s = c.state;
+    if (s.airplane)
+        return;
+    Graphics& g = c.g;
+    BarLayout const& l = c.layout;
+    float u = l.u;
+
+    if (s.showWired) {
+        Pen pen(s.wired ? c.color : c.faint, 1.5f * u);
+        pen.SetStartCap(LineCapRound);
+        pen.SetEndCap(LineCapRound);
+        pen.SetLineJoin(LineJoinRound);
+        float ex = l.networkL, ey = l.cy - 5.5f * u + c.dy;
+        PointF plug[] = {{ex, ey},
+                         {ex + 15.0f * u, ey},
+                         {ex + 15.0f * u, ey + 8.0f * u},
+                         {ex + 11.0f * u, ey + 8.0f * u},
+                         {ex + 11.0f * u, ey + 11.0f * u},
+                         {ex + 4.0f * u, ey + 11.0f * u},
+                         {ex + 4.0f * u, ey + 8.0f * u},
+                         {ex, ey + 8.0f * u}};
+        g.DrawPolygon(&pen, plug, 8);
+        for (int i = 0; i < 3; i++) {
+            float px = ex + (4.5f + 3.0f * i) * u;
+            g.DrawLine(&pen, px, ey + 2.2f * u, px, ey + 5.0f * u);
+        }
+        return;
+    }
+
+    Pen pen(c.color, 2.1f * u);
+    pen.SetStartCap(LineCapRound);
+    pen.SetEndCap(LineCapRound);
+    Pen dimPen(c.faint, 2.1f * u);
+    dimPen.SetStartCap(LineCapRound);
+    dimPen.SetEndCap(LineCapRound);
+    SolidBrush brush(c.color);
+    SolidBrush faintBrush(c.faint);
+    float ox = l.networkL + l.networkW / 2, oy = l.cy + 6.0f * u + c.dy;
+    g.DrawArc(s.wifiLevel >= 3 ? &pen : &dimPen, ox - 10.0f * u, oy - 10.0f * u, 20.0f * u,
+              20.0f * u, 225.0f, 90.0f);
+    g.DrawArc(s.wifiLevel >= 2 ? &pen : &dimPen, ox - 6.4f * u, oy - 6.4f * u, 12.8f * u,
+              12.8f * u, 225.0f, 90.0f);
+    float r0 = 3.4f * u;
+    g.FillPie(s.wifiLevel >= 1 ? &brush : &faintBrush, ox - r0, oy - r0, 2 * r0, 2 * r0, 225.0f,
+              90.0f);
+}
+
+BarLayout LayoutBar(BarState const& s, TextStyle const& text, float u, int w, int h,
+                    std::vector<Item>& items) {
+    BarLayout l;
+    l.u = u;
+    l.cy = h / 2.0f;
+    l.dateW = text.Measure(s.dateText);
+    l.timeW = text.Measure(s.timeText);
+    l.percentW = s.showPercentage ? text.Measure(s.percentText) : 0.0f;
+
+    float right = w - EdgePadding(u);
+    l.timeL = right - l.timeW;
+    l.dateL = l.timeL - 11.5f * u - l.dateW;
+    l.clockL = l.dateL;
+
+    float cursor = l.clockL - 23.0f * u;
+    l.airplaneW = 12.0f * u;
+    if (s.airplane) {
+        l.airplaneL = cursor - l.airplaneW;
+        cursor = l.airplaneL - 22.0f * u;
+    }
+    l.bluetoothW = 8.0f * u;
+    if (s.bluetooth) {
+        l.bluetoothL = cursor - l.bluetoothW;
+        cursor = l.bluetoothL - 22.0f * u;
+    }
+    l.networkW = 15.0f * u;
+    l.networkL = cursor - l.networkW;
+    l.batteryW = 23.0f * u;
+    l.batteryL = (s.airplane ? cursor : l.networkL - 22.0f * u) - l.batteryW;
+    l.percentL = l.batteryL - 5.0f * u - l.percentW;
+
+    auto add = [&](float left, float rightEdge, float padL, float padR, Action action) {
+        items.push_back({{(LONG)(left - padL), 0, (LONG)(rightEdge + padR), h}, action});
+    };
+    if (s.airplane)
+        add(l.airplaneL, l.airplaneL + l.airplaneW, 8 * u, 11 * u, kQuickSettings);
+    if (s.bluetooth)
+        add(l.bluetoothL, l.bluetoothL + l.bluetoothW, 11 * u, 11 * u, kQuickSettings);
+    add(s.showPercentage ? l.percentL : l.batteryL, l.batteryL + l.batteryW, 8 * u, 11 * u,
+        kQuickSettings);
+    if (!s.airplane)
+        add(l.networkL, l.networkL + l.networkW, 11 * u, 10.5f * u, kQuickSettings);
+    add(l.clockL, right, 11.5f * u, 8 * u, kNotifications);
+    return l;
+}
+
+BarState ReadBarState() {
+    BarState s;
+    RadioIcons radios = ReadRadioIcons();
+    s.airplane = radios.airplane;
+    s.bluetooth = radios.bluetooth;
+    s.bluetoothConnected = radios.bluetoothConnected;
+    s.dateText = DateText();
+    s.showWired = radios.wired || !radios.hasWifi;
+    s.timeText = TimeText();
+    s.wifiLevel = radios.wifiLevel;
+    s.wired = radios.wired;
+
+    SYSTEM_POWER_STATUS ps{};
+    bool hasBattery = GetSystemPowerStatus(&ps) && HasBattery(ps);
+    s.level = hasBattery ? ps.BatteryLifePercent : 100;
+    s.charging = hasBattery && ps.ACLineStatus == 1;
+    s.showPercentage = hasBattery && g_showPercentage;
+    s.percentText = std::to_wstring(s.level) + L"%";
+    if (SaverActive(ps))
+        s.batteryColor = Gdiplus::Color(255, 255, 214, 10);
+    else if (s.level <= 20)
+        s.batteryColor = Gdiplus::Color(255, 255, 69, 58);
+    else if (s.charging)
+        s.batteryColor = Gdiplus::Color(255, 52, 199, 89);
+    return s;
+}
+
 void Paint(HWND hwnd) {
     RECT wr{};
     GetWindowRect(hwnd, &wr);
@@ -1613,238 +1889,50 @@ void Paint(HWND hwnd) {
 
     if (!EnsureSurface(w, h))
         return;
-    void* bits = g_surfaceBits;
 
     std::vector<Item> items;
     {
         using namespace Gdiplus;
-        Bitmap canvas(w, h, w * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        Bitmap canvas(w, h, w * 4, PixelFormat32bppPARGB, (BYTE*)g_surfaceBits);
         Graphics g(&canvas);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
         g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
-
         g.Clear(Gdiplus::Color(0, 0, 0, 0));
 
         StringFormat fmt(StringFormat::GenericTypographic());
         fmt.SetLineAlignment(StringAlignmentCenter);
         fmt.SetFormatFlags(fmt.GetFormatFlags() | StringFormatFlagsMeasureTrailingSpaces);
 
-        auto measure = [&](std::wstring const& t, Font& f) {
-            RectF box;
-            g.MeasureString(t.c_str(), -1, &f, PointF(0, 0), &fmt, &box);
-            return box.Width;
-        };
-
-        float u = s;
-        float cy = h / 2.0f;
-
-        if (!g_clockFont || g_clockFontSize != 14.0f * u) {
-            g_clockFont = std::make_unique<Font>(L"Segoe UI Variable Text", 14.0f * u,
+        if (!g_clockFont || g_clockFontSize != 14.0f * s) {
+            g_clockFont = std::make_unique<Font>(L"Segoe UI Variable Text", 14.0f * s,
                                                  FontStyleRegular, UnitPixel);
             if (!g_clockFont->IsAvailable())
                 g_clockFont =
-                    std::make_unique<Font>(L"Segoe UI", 14.0f * u, FontStyleRegular, UnitPixel);
-            g_clockFontSize = 14.0f * u;
-        }
-        Font& cf = *g_clockFont;
-        std::wstring dateText = DateText();
-        std::wstring timeText = TimeText();
-        float timeW = measure(timeText, cf);
-        float dateW = measure(dateText, cf);
-
-        float edge = EdgePadding(s);
-
-        float right = w - edge;
-        float timeL = right - timeW;
-        float dateR = timeL - 11.5f * u;
-        float dateL = dateR - dateW;
-        float clockL = dateL;
-        RadioIcons radios = ReadRadioIcons();
-        bool airplane = radios.airplane, bluetooth = radios.bluetooth;
-        bool bluetoothConnected = radios.bluetoothConnected;
-        int wifiLevel = radios.wifiLevel;
-        bool wired = radios.wired;
-        bool showWired = radios.wired || !radios.hasWifi;
-        SYSTEM_POWER_STATUS ps{};
-        bool hasBattery = GetSystemPowerStatus(&ps) && ps.BatteryFlag != 128 &&
-                          ps.BatteryLifePercent <= 100;
-        int level = hasBattery ? ps.BatteryLifePercent : 100;
-        bool showPercentage = hasBattery && g_showPercentage;
-        std::wstring percentText = std::to_wstring(level) + L"%";
-        float percentW = showPercentage ? measure(percentText, cf) : 0.0f;
-        float cursor = clockL - 23.0f * u;
-        float apR = 0, apW = 12.0f * u, apL = 0;
-        if (airplane) {
-            apR = cursor;
-            apL = apR - apW;
-            cursor = apL - 22.0f * u;
-        }
-        float blR = 0, blW = 8.0f * u, blL = 0;
-        if (bluetooth) {
-            blR = cursor;
-            blL = blR - blW;
-            cursor = blL - 22.0f * u;
-        }
-        float wfR = cursor, wfW = 15.0f * u, wfL = wfR - wfW;
-        float btR = (airplane ? cursor : wfL - 22.0f * u), btW = 23.0f * u, btL = btR - btW;
-
-        auto addItem = [&](float l, float r, float padL, float padR, Action action) {
-            items.push_back({{(LONG)(l - padL), 0, (LONG)(r + padR), h}, action});
-        };
-        if (airplane)
-            addItem(apL, apR, 8 * u, 11 * u, kQuickSettings);
-        if (bluetooth)
-            addItem(blL, blR, 11 * u, 11 * u, kQuickSettings);
-        float percentL = btL - 5.0f * u - percentW;
-        addItem(showPercentage ? percentL : btL, btR, 8 * u, 11 * u, kQuickSettings);
-        if (!airplane)
-            addItem(wfL, wfR, 11 * u, 10.5f * u, kQuickSettings);
-        addItem(clockL, right, 11.5f * u, 8 * u, kNotifications);
-
-        {
-            SolidBrush hitBrush(Gdiplus::Color(3, 0, 0, 0));
-            for (auto const& item : items)
-                g.FillRectangle(&hitBrush, RectF((REAL)item.rc.left, (REAL)item.rc.top,
-                                                 (REAL)(item.rc.right - item.rc.left),
-                                                 (REAL)(item.rc.bottom - item.rc.top)));
+                    std::make_unique<Font>(L"Segoe UI", 14.0f * s, FontStyleRegular, UnitPixel);
+            g_clockFontSize = 14.0f * s;
         }
 
-        bool charging = hasBattery && ps.ACLineStatus == 1;
-        bool saver = SaverActive(ps);
-        Gdiplus::Color batteryColor(255, 255, 255, 255);
-        if (saver)
-            batteryColor = Gdiplus::Color(255, 255, 214, 10);
-        else if (level <= 20)
-            batteryColor = Gdiplus::Color(255, 255, 69, 58);
-        else if (charging)
-            batteryColor = Gdiplus::Color(255, 52, 199, 89);
+        BarState state = ReadBarState();
+        TextStyle text{*g_clockFont, fmt, g, (float)h};
+        BarLayout layout = LayoutBar(state, text, s, w, h, items);
 
-        auto roundRect = [](GraphicsPath& path, float x, float y, float w, float h, float r) {
-            r = std::min(r, std::min(w, h) / 2);
-            path.AddArc(x, y, 2 * r, 2 * r, 180, 90);
-            path.AddArc(x + w - 2 * r, y, 2 * r, 2 * r, 270, 90);
-            path.AddArc(x + w - 2 * r, y + h - 2 * r, 2 * r, 2 * r, 0, 90);
-            path.AddArc(x, y + h - 2 * r, 2 * r, 2 * r, 90, 90);
-            path.CloseFigure();
-        };
+        SolidBrush hitBrush(Gdiplus::Color(3, 0, 0, 0));
+        for (auto const& item : items)
+            g.FillRectangle(&hitBrush, RectF((REAL)item.rc.left, (REAL)item.rc.top,
+                                             (REAL)(item.rc.right - item.rc.left),
+                                             (REAL)(item.rc.bottom - item.rc.top)));
 
         auto drawAll = [&](Gdiplus::Color color, float dy) {
-            SolidBrush brush(color);
             Gdiplus::Color faint(BYTE(color.GetA() * 0.4), color.GetR(), color.GetG(),
                                  color.GetB());
-            SolidBrush faintBrush(faint);
-
-            {
-                if (g_batteryScale > 1.0001) {
-                    float zx = btL + (btW - 2.0f * u) / 2, zy = cy + dy;
-                    g.TranslateTransform(zx, zy);
-                    g.ScaleTransform((float)g_batteryScale, (float)g_batteryScale);
-                    g.TranslateTransform(-zx, -zy);
-                }
-                float bodyW = btW - 2.0f * u, bodyH = 11.0f * u;
-                float x = btL, y = cy - bodyH / 2 + dy;
-                GraphicsPath body;
-                roundRect(body, x, y, bodyW, bodyH, 3.5f * u);
-                g.FillPath(&faintBrush, &body);
-                float inset = 1.5f * u;
-                float fillW = (bodyW - 2 * inset) * level / 100.0f;
-                if (fillW > 0) {
-                    GraphicsPath fill;
-                    roundRect(fill, x + inset, y + inset, fillW, bodyH - 2 * inset, 2.2f * u);
-                    SolidBrush levelBrush(color.GetA() == 255 ? batteryColor : color);
-                    g.FillPath(&levelBrush, &fill);
-                }
-                if (charging && color.GetA() == 255) {
-                    float bx = x + bodyW / 2, by = y + bodyH / 2;
-                    static const float k[][2] = {{1.3f, -4.2f}, {-2.3f, 0.7f}, {-0.2f, 0.7f},
-                                                 {-1.3f, 4.2f}, {2.3f, -0.7f}, {0.2f, -0.7f}};
-                    PointF bolt[6];
-                    for (int i = 0; i < 6; i++)
-                        bolt[i] = PointF(bx + k[i][0] * 1.25f * u, by + k[i][1] * 1.25f * u);
-                    Pen boltEdge(Gdiplus::Color(140, 0, 0, 0), 0.8f * u);
-                    boltEdge.SetLineJoin(LineJoinRound);
-                    SolidBrush boltFill(Gdiplus::Color(255, 255, 255, 255));
-                    g.DrawPolygon(&boltEdge, bolt, 6);
-                    g.FillPolygon(&boltFill, bolt, 6);
-                }
-                GraphicsPath cap;
-                roundRect(cap, x + bodyW + 0.7f * u, cy - 2.2f * u + dy, 1.3f * u, 4.4f * u,
-                          0.65f * u);
-                g.FillPath(&faintBrush, &cap);
-                g.ResetTransform();
-            }
-
-            if (showPercentage)
-                g.DrawString(percentText.c_str(), -1, &cf,
-                             RectF(percentL, dy, percentW + 2, (REAL)h), &fmt, &brush);
-
-            if (bluetooth) {
-                Pen pen(bluetoothConnected ? color : faint, 1.4f * u);
-                pen.SetStartCap(LineCapRound);
-                pen.SetEndCap(LineCapRound);
-                pen.SetLineJoin(LineJoinRound);
-                float bx = blL + blW / 2, by = cy + dy;
-                PointF pts[] = {{bx - 3.4f * u, by - 3.1f * u}, {bx + 3.3f * u, by + 3.1f * u},
-                                {bx, by + 6.0f * u},           {bx, by - 6.0f * u},
-                                {bx + 3.3f * u, by - 3.1f * u}, {bx - 3.4f * u, by + 3.1f * u}};
-                g.DrawLines(&pen, pts, 6);
-            }
-
-            if (airplane) {
-                float ax = apL + apW / 2, ay = cy + dy;
-                static const float k[][2] = {
-                    {0, -7},     {1.3f, -4},  {1.3f, -1.5f}, {7, 2.5f},  {7, 4},      {1.3f, 2},
-                    {1.3f, 5},   {3, 6.5f},   {3, 7.5f},     {0, 6.8f},  {-3, 7.5f},  {-3, 6.5f},
-                    {-1.3f, 5},  {-1.3f, 2},  {-7, 4},       {-7, 2.5f}, {-1.3f, -1.5f}, {-1.3f, -4}};
-                PointF pts[18];
-                for (int i = 0; i < 18; i++)
-                    pts[i] = PointF(ax + k[i][0] * 0.86f * u, ay + k[i][1] * 0.86f * u);
-                g.FillPolygon(&brush, pts, 18);
-            }
-
-            if (!airplane && showWired) {
-                Pen pen(wired ? color : faint, 1.5f * u);
-                pen.SetStartCap(LineCapRound);
-                pen.SetEndCap(LineCapRound);
-                pen.SetLineJoin(LineJoinRound);
-                float ex = wfL, ey = cy - 5.5f * u + dy;
-                PointF plug[] = {{ex, ey},
-                                 {ex + 15.0f * u, ey},
-                                 {ex + 15.0f * u, ey + 8.0f * u},
-                                 {ex + 11.0f * u, ey + 8.0f * u},
-                                 {ex + 11.0f * u, ey + 11.0f * u},
-                                 {ex + 4.0f * u, ey + 11.0f * u},
-                                 {ex + 4.0f * u, ey + 8.0f * u},
-                                 {ex, ey + 8.0f * u}};
-                g.DrawPolygon(&pen, plug, 8);
-                for (int i = 0; i < 3; i++) {
-                    float px = ex + (4.5f + 3.0f * i) * u;
-                    g.DrawLine(&pen, px, ey + 2.2f * u, px, ey + 5.0f * u);
-                }
-            } else if (!airplane) {
-                Pen pen(color, 2.1f * u);
-                pen.SetStartCap(LineCapRound);
-                pen.SetEndCap(LineCapRound);
-                Pen dimPen(faint, 2.1f * u);
-                dimPen.SetStartCap(LineCapRound);
-                dimPen.SetEndCap(LineCapRound);
-                float ox = wfL + wfW / 2, oy = cy + 6.0f * u + dy;
-                g.DrawArc(wifiLevel >= 3 ? &pen : &dimPen, ox - 10.0f * u, oy - 10.0f * u,
-                          20.0f * u, 20.0f * u, 225.0f, 90.0f);
-                g.DrawArc(wifiLevel >= 2 ? &pen : &dimPen, ox - 6.4f * u, oy - 6.4f * u,
-                          12.8f * u, 12.8f * u, 225.0f, 90.0f);
-                float r0 = 3.4f * u;
-                g.FillPie(wifiLevel >= 1 ? &brush : &faintBrush, ox - r0, oy - r0, 2 * r0,
-                          2 * r0, 225.0f, 90.0f);
-            }
-
-            g.DrawString(dateText.c_str(), -1, &cf, RectF(dateL, dy, dateW + 2, (REAL)h), &fmt,
-                         &brush);
-            g.DrawString(timeText.c_str(), -1, &cf, RectF(timeL, dy, timeW + 2, (REAL)h), &fmt,
-                         &brush);
+            DrawContext c{color, dy, faint, g, layout, state, text};
+            DrawBattery(c);
+            DrawBluetooth(c);
+            DrawAirplane(c);
+            DrawNetwork(c);
+            DrawClock(c);
         };
-
-        drawAll(Gdiplus::Color(70, 0, 0, 0), 1.0f * u);
+        drawAll(Gdiplus::Color(70, 0, 0, 0), 1.0f * s);
         drawAll(Gdiplus::Color(255, 255, 255, 255), 0);
     }
 
@@ -1966,7 +2054,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         case WM_CLOSE:
-
             if (Motion::Enabled() && !g_closing && g_winAlpha > 0.02 && g_surfaceDC) {
                 g_closing = true;
                 g_winAlphaTarget = 0.0;
@@ -2077,17 +2164,15 @@ void ReloadSettings() {
         PostMessage(hwnd, kRadioMsg, 0, 0);
 }
 
-bool Stop() {
+void Stop() {
     if (!g_thread)
-        return true;
+        return;
     if (HWND hwnd = g_wnd.load())
         PostMessage(hwnd, WM_CLOSE, 0, 0);
-    if (WaitForSingleObject(g_thread, 5000) == WAIT_TIMEOUT) {
-        return false;
-    }
+    if (WaitForSingleObject(g_thread, 5000) == WAIT_TIMEOUT)
+        TerminateThread(g_thread, 0);
     CloseHandle(g_thread);
     g_thread = nullptr;
-    return true;
 }
 }
 
@@ -2911,8 +2996,7 @@ bool IsExplorerProcess() {
     WCHAR path[MAX_PATH];
     if (!GetModuleFileName(nullptr, path, ARRAYSIZE(path)))
         return false;
-    PCWSTR name = wcsrchr(path, L'\\');
-    return name && _wcsicmp(name + 1, L"explorer.exe") == 0;
+    return _wcsicmp(BaseName(path), L"explorer.exe") == 0;
 }
 
 bool InitShell() {
