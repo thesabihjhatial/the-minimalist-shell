@@ -6,7 +6,7 @@
 // @author          Muhammad Sabih
 // @include         *
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lgdi32 -luser32 -lgdiplus -lshell32 -ladvapi32 -ldwmapi -luuid
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lgdi32 -luser32 -lgdiplus -lshell32 -ladvapi32 -ldwmapi -luuid -lwlanapi
 // ==/WindhawkMod==
 
 #ifndef NOMINMAX
@@ -20,6 +20,7 @@
 #include <shellapi.h>
 #include <uiautomation.h>
 #include <windowsx.h>
+#include <wlanapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -54,9 +55,12 @@
 
 #undef GetCurrentTime
 
+#include <winrt/Windows.Devices.Bluetooth.h>
+#include <winrt/Windows.Devices.Enumeration.h>
 #include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
@@ -891,13 +895,22 @@ constexpr GUID kPowerSavingGuid = {
     0xE00958C0, 0xC213, 0x4ACE, {0xAC, 0x77, 0xFE, 0xCC, 0xED, 0x2E, 0xEE, 0xA5}};
 constexpr BYTE kVignettePeak = 64;
 enum Edge { kEdgeBottom, kEdgeLeft, kEdgeRight, kEdgeTop };
-HDC g_vignetteDC = nullptr;
-HBITMAP g_vignetteBitmap = nullptr;
-Edge g_vignetteEdge = kEdgeBottom;
-HGDIOBJ g_vignetteOld = nullptr;
-RECT g_vignetteRect{};
-HWND g_vignette = nullptr;
 
+struct Vignette {
+    HBITMAP bitmap = nullptr;
+    HDC dc = nullptr;
+    Edge edge = kEdgeBottom;
+    HGDIOBJ old = nullptr;
+    RECT rect{};
+    HWND wnd = nullptr;
+};
+
+Vignette g_vignetteBottom;
+Vignette g_vignetteTop;
+
+namespace Bluetooth = winrt::Windows::Devices::Bluetooth;
+namespace Connectivity = winrt::Windows::Networking::Connectivity;
+namespace Enumeration = winrt::Windows::Devices::Enumeration;
 namespace Radios = winrt::Windows::Devices::Radios;
 
 void PressKeys(std::initializer_list<WORD> keys) {
@@ -1017,12 +1030,123 @@ struct RadioSnapshot {
     bool bluetoothOn = false;
 };
 
-bool g_radioAirplane = false;
-bool g_radioBluetooth = false;
+struct RadioIcons {
+    bool airplane = false;
+    bool bluetooth = false;
+    bool bluetoothConnected = false;
+    bool hasWifi = false;
+    bool wired = false;
+    int wifiLevel = 0;
+
+    bool operator==(RadioIcons const&) const = default;
+};
+
+std::atomic<int> g_bluetoothWatchPending{0};
 HANDLE g_radioChangeEvent = nullptr;
+RadioIcons g_radioIcons;
 std::mutex g_radioMutex;
 HANDLE g_radioStopEvent = nullptr;
 HANDLE g_radioThread = nullptr;
+
+std::vector<winrt::hstring> BluetoothSelectors() {
+    auto connected = Bluetooth::BluetoothConnectionStatus::Connected;
+    return {Bluetooth::BluetoothDevice::GetDeviceSelectorFromConnectionStatus(connected),
+            Bluetooth::BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(connected)};
+}
+
+bool AnyBluetoothConnected(std::vector<winrt::hstring> const& selectors) {
+    for (auto const& selector : selectors) {
+        auto op = Enumeration::DeviceInformation::FindAllAsync(selector);
+        if (op.wait_for(std::chrono::seconds(2)) !=
+            winrt::Windows::Foundation::AsyncStatus::Completed) {
+            op.Cancel();
+            continue;
+        }
+        if (op.GetResults().Size() > 0)
+            return true;
+    }
+    return false;
+}
+
+std::vector<Enumeration::DeviceWatcher> StartBluetoothWatchers(
+    std::vector<winrt::hstring> const& selectors) {
+    g_bluetoothWatchPending = (int)selectors.size();
+    std::vector<Enumeration::DeviceWatcher> watchers;
+    for (auto const& selector : selectors) {
+        auto watcher = Enumeration::DeviceInformation::CreateWatcher(selector);
+        auto notify = [](auto&&, auto&&) {
+            if (g_bluetoothWatchPending <= 0)
+                SetEvent(g_radioChangeEvent);
+        };
+        watcher.Added(notify);
+        watcher.Removed(notify);
+        watcher.EnumerationCompleted([](auto&&, auto&&) { g_bluetoothWatchPending--; });
+        watcher.Start();
+        watchers.push_back(watcher);
+    }
+    return watchers;
+}
+
+bool WiredConnected() {
+    for (auto const& profile : Connectivity::NetworkInformation::GetConnectionProfiles()) {
+        auto adapter = profile.NetworkAdapter();
+        if (adapter && adapter.IanaInterfaceType() == 6 &&
+            profile.GetNetworkConnectivityLevel() != Connectivity::NetworkConnectivityLevel::None)
+            return true;
+    }
+    return false;
+}
+
+int WifiLevel(HANDLE wlan, bool& present) {
+    present = false;
+    if (!wlan)
+        return 0;
+    PWLAN_INTERFACE_INFO_LIST list = nullptr;
+    if (WlanEnumInterfaces(wlan, nullptr, &list) != ERROR_SUCCESS)
+        return 0;
+    present = list->dwNumberOfItems > 0;
+    int level = 0;
+    for (DWORD i = 0; i < list->dwNumberOfItems && !level; i++) {
+        PWLAN_CONNECTION_ATTRIBUTES connection = nullptr;
+        DWORD size = 0;
+        if (WlanQueryInterface(wlan, &list->InterfaceInfo[i].InterfaceGuid,
+                               wlan_intf_opcode_current_connection, nullptr, &size,
+                               (PVOID*)&connection, nullptr) != ERROR_SUCCESS)
+            continue;
+        ULONG quality = connection->wlanAssociationAttributes.wlanSignalQuality;
+        level = 1 + (quality >= 34) + (quality >= 67);
+        WlanFreeMemory(connection);
+    }
+    WlanFreeMemory(list);
+    return level;
+}
+
+HANDLE OpenWlan() {
+    HANDLE wlan = nullptr;
+    DWORD version = 0;
+    if (WlanOpenHandle(2, nullptr, &version, &wlan) != ERROR_SUCCESS)
+        return nullptr;
+    WlanRegisterNotification(
+        wlan, WLAN_NOTIFICATION_SOURCE_ACM | WLAN_NOTIFICATION_SOURCE_MSM, FALSE,
+        [](PWLAN_NOTIFICATION_DATA, PVOID) { SetEvent(g_radioChangeEvent); }, nullptr, nullptr,
+        nullptr);
+    return wlan;
+}
+
+void CloseWlan(HANDLE wlan) {
+    if (!wlan)
+        return;
+    WlanRegisterNotification(wlan, WLAN_NOTIFICATION_SOURCE_NONE, FALSE, nullptr, nullptr,
+                             nullptr, nullptr);
+    WlanCloseHandle(wlan, nullptr);
+}
+
+bool WaitForRadioChange(HANDLE (&waits)[2]) {
+    DWORD result = WaitForMultipleObjects(2, waits, FALSE, 60000);
+    if (result == WAIT_OBJECT_0)
+        return false;
+    return result != WAIT_OBJECT_0 + 1 || WaitForSingleObject(g_radioStopEvent, 200) != WAIT_OBJECT_0;
+}
 
 DWORD WINAPI RadioThreadProc(void*) {
     bool apartment = false;
@@ -1044,6 +1168,23 @@ DWORD WINAPI RadioThreadProc(void*) {
         }
         subscriptions.clear();
     };
+
+    std::vector<winrt::hstring> selectors;
+    std::vector<Enumeration::DeviceWatcher> watchers;
+    try {
+        selectors = BluetoothSelectors();
+        watchers = StartBluetoothWatchers(selectors);
+    } catch (...) {}
+
+    HANDLE wlan = OpenWlan();
+
+    winrt::event_token networkToken{};
+    bool networkWatched = false;
+    try {
+        networkToken = Connectivity::NetworkInformation::NetworkStatusChanged(
+            [](IInspectable const&) { SetEvent(g_radioChangeEvent); });
+        networkWatched = true;
+    } catch (...) {}
 
     HANDLE waits[] = {g_radioStopEvent, g_radioChangeEvent};
     do {
@@ -1074,22 +1215,44 @@ DWORD WINAPI RadioThreadProc(void*) {
             }
         } catch (...) {}
 
-        bool airplane = IsAirplaneMode() || (snap.known && !snap.anyOn);
-        bool bluetooth = !airplane && snap.bluetoothOn;
+        RadioIcons icons;
+        icons.airplane = IsAirplaneMode() || (snap.known && !snap.anyOn);
+        icons.bluetooth = !icons.airplane && snap.bluetoothOn;
+        if (icons.bluetooth) {
+            try {
+                icons.bluetoothConnected = AnyBluetoothConnected(selectors);
+            } catch (...) {}
+        }
+        if (!icons.airplane)
+            icons.wifiLevel = WifiLevel(wlan, icons.hasWifi);
+        try {
+            icons.wired = WiredConnected();
+        } catch (...) {}
         bool changed;
         {
             std::lock_guard<std::mutex> lock(g_radioMutex);
-            changed = g_radioAirplane != airplane || g_radioBluetooth != bluetooth;
-            g_radioAirplane = airplane;
-            g_radioBluetooth = bluetooth;
+            changed = g_radioIcons != icons;
+            g_radioIcons = icons;
         }
         if (changed) {
             if (HWND bar = g_wnd.load())
                 PostMessage(bar, kRadioMsg, 0, 0);
         }
 
-    } while (WaitForMultipleObjects(2, waits, FALSE, 60000) != WAIT_OBJECT_0);
+    } while (WaitForRadioChange(waits));
 
+    for (auto const& watcher : watchers) {
+        try {
+            watcher.Stop();
+        } catch (...) {}
+    }
+    watchers.clear();
+    if (networkWatched) {
+        try {
+            Connectivity::NetworkInformation::NetworkStatusChanged(networkToken);
+        } catch (...) {}
+    }
+    CloseWlan(wlan);
     unsubscribe();
     if (key)
         RegCloseKey(key);
@@ -1122,10 +1285,9 @@ void StopRadioWorker() {
     g_radioChangeEvent = nullptr;
 }
 
-void ReadRadioIcons(bool* airplane, bool* bluetooth) {
+RadioIcons ReadRadioIcons() {
     std::lock_guard<std::mutex> lock(g_radioMutex);
-    *airplane = g_radioAirplane;
-    *bluetooth = g_radioBluetooth;
+    return g_radioIcons;
 }
 
 struct PaintKey {
@@ -1133,8 +1295,7 @@ struct PaintKey {
     std::wstring time;
     int batteryPercent = -1;
     int acLine = -1;
-    bool airplane = false;
-    bool bluetooth = false;
+    RadioIcons radios;
     bool saver = false;
 };
 
@@ -1142,7 +1303,7 @@ PaintKey CurrentPaintKey() {
     PaintKey key;
     key.date = DateText();
     key.time = TimeText();
-    ReadRadioIcons(&key.airplane, &key.bluetooth);
+    key.radios = ReadRadioIcons();
     SYSTEM_POWER_STATUS ps{};
     if (GetSystemPowerStatus(&ps)) {
         key.batteryPercent = ps.BatteryLifePercent;
@@ -1155,8 +1316,7 @@ PaintKey CurrentPaintKey() {
 
 bool SamePaintKey(PaintKey const& a, PaintKey const& b) {
     return a.date == b.date && a.time == b.time && a.batteryPercent == b.batteryPercent &&
-           a.acLine == b.acLine && a.airplane == b.airplane && a.bluetooth == b.bluetooth &&
-           a.saver == b.saver;
+           a.acLine == b.acLine && a.radios == b.radios && a.saver == b.saver;
 }
 
 PaintKey g_paintKey;
@@ -1309,21 +1469,25 @@ bool EnsureSurface(int w, int h) {
     return true;
 }
 
-void ReleaseVignette() {
-    if (g_vignetteDC) {
-        if (g_vignetteOld)
-            SelectObject(g_vignetteDC, g_vignetteOld);
-        DeleteDC(g_vignetteDC);
+void ReleaseVignette(Vignette& v) {
+    if (v.dc) {
+        if (v.old)
+            SelectObject(v.dc, v.old);
+        DeleteDC(v.dc);
     }
-    if (g_vignetteBitmap)
-        DeleteObject(g_vignetteBitmap);
-    g_vignetteDC = nullptr;
-    g_vignetteBitmap = nullptr;
-    g_vignetteOld = nullptr;
-    g_vignetteRect = {};
+    if (v.bitmap)
+        DeleteObject(v.bitmap);
+    v.dc = nullptr;
+    v.bitmap = nullptr;
+    v.old = nullptr;
+    v.rect = {};
 }
 
-bool VignetteSuppressed(HWND tray) {
+bool TopVignetteSuppressed(HWND) {
+    return g_fullscreen;
+}
+
+bool BottomVignetteSuppressed(HWND tray) {
     if (g_fullscreen || !tray || !IsWindowVisible(tray))
         return true;
     APPBARDATA abd{sizeof(abd)};
@@ -1355,8 +1519,8 @@ void FillVignette(DWORD* bits, int w, int h, Edge edge) {
     }
 }
 
-void PresentVignette(bool alphaOnly = false) {
-    if (!g_vignette || !g_screenDC)
+void PresentVignette(Vignette& v, HWND anchor, bool (*suppressed)(HWND), bool alphaOnly) {
+    if (!v.wnd || !g_screenDC)
         return;
     BYTE alpha = (BYTE)std::lround(std::clamp(g_winAlpha, 0.0, 1.0) * 255.0);
     BLENDFUNCTION blend{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
@@ -1365,48 +1529,52 @@ void PresentVignette(bool alphaOnly = false) {
     auto update = [&](RECT const& r) {
         POINT dst{r.left, r.top};
         SIZE size{r.right - r.left, r.bottom - r.top};
-        UpdateLayeredWindow(g_vignette, g_screenDC, &dst, &size, g_vignetteDC, &src, 0, &blend,
-                            ULW_ALPHA);
+        UpdateLayeredWindow(v.wnd, g_screenDC, &dst, &size, v.dc, &src, 0, &blend, ULW_ALPHA);
     };
 
-    if (alphaOnly && g_vignetteBitmap && IsWindowVisible(g_vignette)) {
-        update(g_vignetteRect);
+    if (alphaOnly && v.bitmap && IsWindowVisible(v.wnd)) {
+        update(v.rect);
         return;
     }
 
-    HWND tray = FindWindow(L"Shell_TrayWnd", nullptr);
     RECT r{};
-    if (VignetteSuppressed(tray) || !GetWindowRect(tray, &r) || r.right <= r.left ||
+    if (!anchor || suppressed(anchor) || !GetWindowRect(anchor, &r) || r.right <= r.left ||
         r.bottom <= r.top) {
-        ShowWindow(g_vignette, SW_HIDE);
+        ShowWindow(v.wnd, SW_HIDE);
         return;
     }
 
     Edge edge = VignetteEdge(r);
-    if (!g_vignetteBitmap || !EqualRect(&r, &g_vignetteRect) || edge != g_vignetteEdge) {
-        ReleaseVignette();
+    if (!v.bitmap || !EqualRect(&r, &v.rect) || edge != v.edge) {
+        ReleaseVignette(v);
         void* bits = nullptr;
-        g_vignetteDC = CreateCompatibleDC(g_screenDC);
-        if (g_vignetteDC)
-            g_vignetteBitmap = CreateDib(g_vignetteDC, r.right - r.left, r.bottom - r.top, &bits);
-        if (!g_vignetteBitmap || !bits) {
-            ReleaseVignette();
-            ShowWindow(g_vignette, SW_HIDE);
+        v.dc = CreateCompatibleDC(g_screenDC);
+        if (v.dc)
+            v.bitmap = CreateDib(v.dc, r.right - r.left, r.bottom - r.top, &bits);
+        if (!v.bitmap || !bits) {
+            ReleaseVignette(v);
+            ShowWindow(v.wnd, SW_HIDE);
             return;
         }
-        g_vignetteOld = SelectObject(g_vignetteDC, g_vignetteBitmap);
+        v.old = SelectObject(v.dc, v.bitmap);
         FillVignette((DWORD*)bits, r.right - r.left, r.bottom - r.top, edge);
-        g_vignetteRect = r;
-        g_vignetteEdge = edge;
+        v.rect = r;
+        v.edge = edge;
     }
 
-    SetWindowPos(g_vignette, tray, r.left, r.top, r.right - r.left, r.bottom - r.top,
+    SetWindowPos(v.wnd, anchor, r.left, r.top, r.right - r.left, r.bottom - r.top,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
     update(r);
 }
 
+void PresentVignettes(bool alphaOnly = false) {
+    PresentVignette(g_vignetteBottom, FindWindow(L"Shell_TrayWnd", nullptr),
+                    BottomVignetteSuppressed, alphaOnly);
+    PresentVignette(g_vignetteTop, g_wnd.load(), TopVignetteSuppressed, alphaOnly);
+}
+
 void PresentLayered(HWND hwnd, bool alphaOnly) {
-    PresentVignette(alphaOnly);
+    PresentVignettes(alphaOnly);
     if (!hwnd || !g_surfaceDC || g_surfaceW <= 0 || g_surfaceH <= 0)
         return;
     RECT wr{};
@@ -1444,18 +1612,6 @@ void Paint(HWND hwnd) {
         g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
 
         g.Clear(Gdiplus::Color(0, 0, 0, 0));
-
-        {
-            SolidBrush hitBrush(Gdiplus::Color(3, 0, 0, 0));
-            g.FillRectangle(&hitBrush, RectF(0.0f, 0.0f, (REAL)w, (REAL)h));
-        }
-
-        {
-            LinearGradientBrush shade(PointF(0.0f, 0.0f), PointF(0.0f, (REAL)h),
-                                      Gdiplus::Color(kVignettePeak, 0, 0, 0),
-                                      Gdiplus::Color(0, 0, 0, 0));
-            g.FillRectangle(&shade, RectF(0.0f, 0.0f, (REAL)w, (REAL)h));
-        }
 
         StringFormat fmt(StringFormat::GenericTypographic());
         fmt.SetLineAlignment(StringAlignmentCenter);
@@ -1498,8 +1654,12 @@ void Paint(HWND hwnd) {
         float clockL = dateL;
         float ccR = clockL - 23.0f * u, ccW = 13.0f * u, ccL = ccR - ccW;
         float seR = ccL - 25.0f * u, seW = 12.0f * u, seL = seR - seW;
-        bool airplane = false, bluetooth = false;
-        ReadRadioIcons(&airplane, &bluetooth);
+        RadioIcons radios = ReadRadioIcons();
+        bool airplane = radios.airplane, bluetooth = radios.bluetooth;
+        bool bluetoothConnected = radios.bluetoothConnected;
+        int wifiLevel = radios.wifiLevel;
+        bool wired = radios.wired;
+        bool showWired = radios.wired || !radios.hasWifi;
         float cursor = seL - 21.0f * u;
         float apR = 0, apW = 12.0f * u, apL = 0;
         if (airplane) {
@@ -1530,6 +1690,14 @@ void Paint(HWND hwnd) {
         addItem(seL, seR, 10.5f * u, 12.5f * u, kSearch);
         addItem(ccL, ccR, 12.5f * u, 11.5f * u, kQuickSettings);
         addItem(clockL, right, 11.5f * u, 8 * u, kNotifications);
+
+        {
+            SolidBrush hitBrush(Gdiplus::Color(3, 0, 0, 0));
+            for (auto const& item : items)
+                g.FillRectangle(&hitBrush, RectF((REAL)item.rc.left, (REAL)item.rc.top,
+                                                 (REAL)(item.rc.right - item.rc.left),
+                                                 (REAL)(item.rc.bottom - item.rc.top)));
+        }
 
         SYSTEM_POWER_STATUS ps{};
         bool hasBattery = GetSystemPowerStatus(&ps) && ps.BatteryFlag != 128 &&
@@ -1606,7 +1774,7 @@ void Paint(HWND hwnd) {
             }
 
             if (bluetooth) {
-                Pen pen(color, 1.4f * u);
+                Pen pen(bluetoothConnected ? color : faint, 1.4f * u);
                 pen.SetStartCap(LineCapRound);
                 pen.SetEndCap(LineCapRound);
                 pen.SetLineJoin(LineJoinRound);
@@ -1629,16 +1797,40 @@ void Paint(HWND hwnd) {
                 g.FillPolygon(&brush, pts, 18);
             }
 
-            if (!airplane) {
+            if (!airplane && showWired) {
+                Pen pen(wired ? color : faint, 1.5f * u);
+                pen.SetStartCap(LineCapRound);
+                pen.SetEndCap(LineCapRound);
+                pen.SetLineJoin(LineJoinRound);
+                float ex = wfL, ey = cy - 5.5f * u + dy;
+                PointF plug[] = {{ex, ey},
+                                 {ex + 15.0f * u, ey},
+                                 {ex + 15.0f * u, ey + 8.0f * u},
+                                 {ex + 11.0f * u, ey + 8.0f * u},
+                                 {ex + 11.0f * u, ey + 11.0f * u},
+                                 {ex + 4.0f * u, ey + 11.0f * u},
+                                 {ex + 4.0f * u, ey + 8.0f * u},
+                                 {ex, ey + 8.0f * u}};
+                g.DrawPolygon(&pen, plug, 8);
+                for (int i = 0; i < 3; i++) {
+                    float px = ex + (4.5f + 3.0f * i) * u;
+                    g.DrawLine(&pen, px, ey + 2.2f * u, px, ey + 5.0f * u);
+                }
+            } else if (!airplane) {
                 Pen pen(color, 2.1f * u);
                 pen.SetStartCap(LineCapRound);
                 pen.SetEndCap(LineCapRound);
+                Pen dimPen(faint, 2.1f * u);
+                dimPen.SetStartCap(LineCapRound);
+                dimPen.SetEndCap(LineCapRound);
                 float ox = wfL + wfW / 2, oy = cy + 6.0f * u + dy;
-                for (float r : {10.0f * u, 6.4f * u}) {
-                    g.DrawArc(&pen, ox - r, oy - r, 2 * r, 2 * r, 225.0f, 90.0f);
-                }
+                g.DrawArc(wifiLevel >= 3 ? &pen : &dimPen, ox - 10.0f * u, oy - 10.0f * u,
+                          20.0f * u, 20.0f * u, 225.0f, 90.0f);
+                g.DrawArc(wifiLevel >= 2 ? &pen : &dimPen, ox - 6.4f * u, oy - 6.4f * u,
+                          12.8f * u, 12.8f * u, 225.0f, 90.0f);
                 float r0 = 3.4f * u;
-                g.FillPie(&brush, ox - r0, oy - r0, 2 * r0, 2 * r0, 225.0f, 90.0f);
+                g.FillPie(wifiLevel >= 1 ? &brush : &faintBrush, ox - r0, oy - r0, 2 * r0,
+                          2 * r0, 225.0f, 90.0f);
             }
 
             {
@@ -1775,7 +1967,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (wParam == ABN_POSCHANGED) {
                 PositionBar(hwnd);
             }
-            PresentVignette();
+            PresentVignettes();
             return 0;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
@@ -1836,9 +2028,10 @@ DWORD WINAPI ThreadProc(void*) {
         kTopBarHeight, nullptr, nullptr, instance, nullptr);
 
     if (hwnd) {
-        g_vignette = CreateWindowEx(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, L"STATIC",
-            nullptr, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
+        for (Vignette* v : {&g_vignetteBottom, &g_vignetteTop})
+            v->wnd = CreateWindowEx(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+                L"STATIC", nullptr, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
         g_wnd = hwnd;
         HPOWERNOTIFY powerNotify =
             RegisterPowerSettingNotification(hwnd, &kPowerSavingGuid, DEVICE_NOTIFY_WINDOW_HANDLE);
@@ -1868,11 +2061,12 @@ DWORD WINAPI ThreadProc(void*) {
             UnregisterPowerSettingNotification(powerNotify);
     }
 
-    if (g_vignette) {
-        DestroyWindow(g_vignette);
-        g_vignette = nullptr;
+    for (Vignette* v : {&g_vignetteBottom, &g_vignetteTop}) {
+        if (v->wnd)
+            DestroyWindow(v->wnd);
+        v->wnd = nullptr;
+        ReleaseVignette(*v);
     }
-    ReleaseVignette();
     g_wnd = nullptr;
     g_items.clear();
     StopRadioWorker();
