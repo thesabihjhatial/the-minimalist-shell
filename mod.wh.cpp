@@ -14,6 +14,9 @@
 - showBatteryPercentage: false
   $name: Show battery percentage
   $description: Shows charge level as text, next to the battery icon in the top bar
+- showNowPlaying: true
+  $name: Show now playing
+  $description: Shows the current track in the center of the top bar. Click it to play or pause
 - translucency: 100
   $name: Translucency
   $description: How see-through the Start menu, Search and taskbar flyouts are from 0 (opaque) to 100 (clearest). Explorer windows and menus always use system acrylic.
@@ -29,6 +32,7 @@
 #include <dwmapi.h>
 #include <gdiplus.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <uiautomation.h>
 #include <uxtheme.h>
 #include <vssym32.h>
@@ -88,6 +92,7 @@
 #include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.Control.h>
 #include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.Input.h>
@@ -581,6 +586,53 @@ void OnLayoutUpdated(std::weak_ptr<DockState> weak) {
     } catch (...) {}
 }
 
+struct PendingFrame {
+    int attempts = 0;
+    winrt::weak_ref<FrameworkElement> frame;
+    void* key = nullptr;
+    DispatcherTimer timer{nullptr};
+};
+
+std::vector<std::shared_ptr<PendingFrame>> g_pending;
+
+void ApplyToFrame(FrameworkElement const& frame);
+
+void ForgetPending(PendingFrame& pending) {
+    pending.timer.Stop();
+    std::erase_if(g_pending, [&](auto const& item) { return item.get() == &pending; });
+}
+
+void RetryFrame(FrameworkElement const& frame) {
+    void* key = AbiKey(frame);
+    for (auto const& item : g_pending) {
+        if (item->key == key)
+            return;
+    }
+    auto pending = std::make_shared<PendingFrame>();
+    pending->frame = winrt::make_weak(frame);
+    pending->key = key;
+    std::weak_ptr<PendingFrame> weak = pending;
+    pending->timer = DispatcherTimer();
+    pending->timer.Interval(std::chrono::milliseconds(500));
+    pending->timer.Tick([weak](Inspectable const&, Inspectable const&) {
+        auto item = weak.lock();
+        if (!item)
+            return;
+        auto target = item->frame.get();
+        if (g_unloading || !target || ++item->attempts > 120) {
+            ForgetPending(*item);
+            return;
+        }
+        try {
+            ApplyToFrame(target);
+        } catch (...) {}
+        if (IsFrameApplied(target))
+            ForgetPending(*item);
+    });
+    g_pending.push_back(pending);
+    pending->timer.Start();
+}
+
 void ApplyToFrame(FrameworkElement const& frame) {
     if (g_unloading || !frame || IsFrameApplied(frame))
         return;
@@ -590,8 +642,10 @@ void ApplyToFrame(FrameworkElement const& frame) {
 
     auto repeater = FindDescendant(
         frame, [](FrameworkElement const& e) { return HasName(e, L"TaskbarFrameRepeater"); }, 6);
-    if (!repeater)
+    if (!repeater) {
+        RetryFrame(frame);
         return;
+    }
 
     if (auto background = FindDescendant(
             frame, [](FrameworkElement const& e) {
@@ -636,6 +690,12 @@ void ApplyToFrame(FrameworkElement const& frame) {
 }
 
 void RestoreAll() {
+    for (auto& pending : g_pending) {
+        try {
+            pending->timer.Stop();
+        } catch (...) {}
+    }
+    g_pending.clear();
     for (auto& st : g_states)
         DetachMagnify(*st);
     g_zooms.clear();
@@ -682,6 +742,8 @@ XamlRoot XamlRootFromTaskbarHostSharedPtr(void* taskbarHostSharedPtr[2]) {
             std__Ref_count_base__Decref_Original(taskbarHostSharedPtr[1]);
         return nullptr;
     }
+    if (!taskbarHostSharedPtr[1])
+        return nullptr;
 
     auto* unk = *(IUnknown**)((BYTE*)taskbarHostSharedPtr[0] + g_taskbarHostElementOffset);
     FrameworkElement fe = nullptr;
@@ -1519,7 +1581,7 @@ bool PaintGlassPart(HTHEME theme, HDC hdc, int part, int state, RECT const& shap
     }
     if (!IsClearPart(name, part, state))
         return false;
-    if (HWND hwnd = WindowFromDC(hdc); hwnd && IsSurface(hwnd))
+    if (HWND hwnd = WindowFromDC(hdc); hwnd && !IsApplied(hwnd) && IsSurface(hwnd))
         ApplySurface(hwnd);
     ClearGlass(hdc, area);
     return true;
@@ -1760,8 +1822,16 @@ void RefreshTheme(LPARAM lParam) {
 
 void Uninstall() {
     ForEachOwnWindow(Restore);
-    std::lock_guard<std::mutex> lock(g_savedMutex);
-    g_saved.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_savedMutex);
+        g_saved.clear();
+    }
+    std::lock_guard<std::mutex> lock(g_brushMutex);
+    for (HBRUSH& brush : g_brushes) {
+        if (brush)
+            DeleteObject(brush);
+        brush = nullptr;
+    }
 }
 }
 
@@ -1886,6 +1956,7 @@ struct Glass {
     static inline std::unordered_map<DWORD, typename X::Dispatcher> dispatchers;
     static inline std::unordered_map<Key, Entry, KeyHash> entries;
     static inline std::mutex mutex;
+    static inline size_t pruneAt = 256;
 
     static typename X::DependencyProperty PropertyOf(typename X::FrameworkElement const& element,
                                                      Role role) {
@@ -1911,10 +1982,6 @@ struct Glass {
         if (!brush)
             brush = typename X::SolidColorBrush(color);
         return brush;
-    }
-
-    static typename X::Brush ClearBrush() {
-        return SharedBrush({0, 0, 0, 0});
     }
 
     static typename X::Brush RimBrush(typename X::SolidColorBrush const& solid) {
@@ -1989,6 +2056,12 @@ struct Glass {
         Key key{AbiKey(element), role};
         if (!brush || IsApplied(key, brush))
             return;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = entries.find(key);
+            if (it != entries.end() && it->second.element.get())
+                it->second.original = element.ReadLocalValue(dp);
+        }
         auto replacement = Replacement(brush, role);
         if (!replacement || InSkippedAncestor(element))
             return;
@@ -1997,9 +2070,12 @@ struct Glass {
             auto it = entries.find(key);
             if (it == entries.end() || !it->second.element.get()) {
                 DWORD thread = GetCurrentThreadId();
-                std::erase_if(entries, [thread](auto const& item) {
-                    return item.second.thread == thread && !item.second.element.get();
-                });
+                if (entries.size() >= pruneAt) {
+                    std::erase_if(entries, [thread](auto const& item) {
+                        return item.second.thread == thread && !item.second.element.get();
+                    });
+                    pruneAt = std::max<size_t>(256, entries.size() * 2);
+                }
                 Entry entry;
                 entry.dp = dp;
                 entry.element = winrt::make_weak(element);
@@ -2206,7 +2282,7 @@ extern "C" __declspec(dllexport) HRESULT STDAPICALLTYPE DllGetClassObject(REFCLS
 }
 
 namespace TopBar {
-enum Action { kNotifications, kQuickSettings };
+enum Action { kNextTrack, kNotifications, kPlayPause, kPreviousTrack, kQuickSettings };
 
 struct Item {
     RECT rc;
@@ -2221,7 +2297,13 @@ bool g_fullscreen = false;
 constexpr UINT kAppBarMsg = WM_APP + 42;
 constexpr WCHAR kClassName[] = L"MinimalistTopBar";
 constexpr UINT_PTR kClockTimerId = 3;
+constexpr UINT kMediaMsg = WM_APP + 44;
 constexpr UINT_PTR kMotionTimerId = 2;
+constexpr float kNowPlayingButton = 9.0f;
+constexpr float kNowPlayingButtonGap = 10.0f;
+constexpr float kNowPlayingDot = 7.0f;
+constexpr float kNowPlayingGap = 6.0f;
+constexpr WCHAR kNowPlayingLabel[] = L"Now Playing";
 constexpr GUID kPowerSavingGuid = {
     0xE00958C0, 0xC213, 0x4ACE, {0xAC, 0x77, 0xFE, 0xCC, 0xED, 0x2E, 0xEE, 0xA5}};
 constexpr double kPulseHoldMs = 1000.0;
@@ -2249,7 +2331,188 @@ Vignette g_vignetteTop;
 namespace Bluetooth = winrt::Windows::Devices::Bluetooth;
 namespace Connectivity = winrt::Windows::Networking::Connectivity;
 namespace Enumeration = winrt::Windows::Devices::Enumeration;
+namespace Control = winrt::Windows::Media::Control;
 namespace Radios = winrt::Windows::Devices::Radios;
+
+using MediaSession = Control::GlobalSystemMediaTransportControlsSession;
+
+struct NowPlaying {
+    bool playing = false;
+    std::wstring text;
+
+    bool operator==(NowPlaying const&) const = default;
+};
+
+Control::GlobalSystemMediaTransportControlsSessionManager g_mediaManager{nullptr};
+winrt::event_token g_mediaManagerToken{};
+std::mutex g_mediaMutex;
+winrt::event_token g_mediaPlaybackToken{};
+winrt::event_token g_mediaPropertiesToken{};
+MediaSession g_mediaSession{nullptr};
+NowPlaying g_nowPlaying;
+std::atomic<bool> g_showNowPlaying{true};
+
+std::wstring AppName(std::wstring const& id) {
+    static std::mutex mutex;
+    static std::unordered_map<std::wstring, std::wstring> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (auto it = cache.find(id); it != cache.end())
+        return it->second;
+    std::wstring name;
+    winrt::com_ptr<IShellItem> item;
+    if (SUCCEEDED(SHCreateItemFromParsingName((L"shell:AppsFolder\\" + id).c_str(), nullptr,
+                                              IID_PPV_ARGS(item.put())))) {
+        PWSTR display = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &display))) {
+            name = display;
+            CoTaskMemFree(display);
+        }
+    }
+    if (name.empty()) {
+        name = id.substr(0, id.find(L'!'));
+        if (name.size() > 4 && _wcsicmp(name.c_str() + name.size() - 4, L".exe") == 0)
+            name.resize(name.size() - 4);
+        if (!name.empty())
+            name[0] = (wchar_t)towupper(name[0]);
+    }
+    return cache[id] = name;
+}
+
+NowPlaying QueryNowPlaying(MediaSession const& session) {
+    NowPlaying result;
+    if (!session)
+        return result;
+    auto op = session.TryGetMediaPropertiesAsync();
+    if (op.wait_for(std::chrono::seconds(2)) != winrt::Windows::Foundation::AsyncStatus::Completed) {
+        op.Cancel();
+        return result;
+    }
+    auto properties = op.GetResults();
+    std::wstring title = properties.Title().c_str();
+    std::wstring artist = properties.Artist().c_str();
+    if (title.empty())
+        return result;
+    std::wstring app = AppName(session.SourceAppUserModelId().c_str());
+    std::wstring track = artist.empty() ? title : title + L" - " + artist;
+    result.text = app.empty() ? track : app + L" --- " + track;
+    result.playing = session.GetPlaybackInfo().PlaybackStatus() ==
+                     Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+    return result;
+}
+
+void RefreshNowPlaying() {
+    if (g_unloading)
+        return;
+    try {
+        MediaSession session{nullptr};
+        {
+            std::lock_guard<std::mutex> lock(g_mediaMutex);
+            session = g_mediaSession;
+        }
+        NowPlaying now = QueryNowPlaying(session);
+        {
+            std::lock_guard<std::mutex> lock(g_mediaMutex);
+            if (now == g_nowPlaying)
+                return;
+            g_nowPlaying = now;
+        }
+        if (HWND bar = g_wnd.load())
+            PostMessage(bar, kMediaMsg, 0, 0);
+    } catch (...) {}
+}
+
+void UnbindMediaSession() {
+    if (!g_mediaSession)
+        return;
+    try {
+        g_mediaSession.MediaPropertiesChanged(g_mediaPropertiesToken);
+        g_mediaSession.PlaybackInfoChanged(g_mediaPlaybackToken);
+    } catch (...) {}
+    g_mediaSession = nullptr;
+}
+
+void BindMediaSession() {
+    MediaSession next{nullptr};
+    try {
+        if (g_mediaManager)
+            next = g_mediaManager.GetCurrentSession();
+    } catch (...) {}
+    std::lock_guard<std::mutex> lock(g_mediaMutex);
+    UnbindMediaSession();
+    if (!next)
+        return;
+    g_mediaSession = next;
+    g_mediaPropertiesToken =
+        next.MediaPropertiesChanged([](auto&&, auto&&) { RefreshNowPlaying(); });
+    g_mediaPlaybackToken = next.PlaybackInfoChanged([](auto&&, auto&&) { RefreshNowPlaying(); });
+}
+
+void StartMedia() {
+    try {
+        auto op = Control::GlobalSystemMediaTransportControlsSessionManager::RequestAsync();
+        if (op.wait_for(std::chrono::seconds(2)) !=
+            winrt::Windows::Foundation::AsyncStatus::Completed) {
+            op.Cancel();
+            return;
+        }
+        g_mediaManager = op.GetResults();
+        g_mediaManagerToken = g_mediaManager.CurrentSessionChanged([](auto&&, auto&&) {
+            if (g_unloading)
+                return;
+            BindMediaSession();
+            RefreshNowPlaying();
+        });
+        BindMediaSession();
+        RefreshNowPlaying();
+    } catch (...) {}
+}
+
+void StopMedia() {
+    try {
+        if (g_mediaManager)
+            g_mediaManager.CurrentSessionChanged(g_mediaManagerToken);
+    } catch (...) {}
+    g_mediaManager = nullptr;
+    std::lock_guard<std::mutex> lock(g_mediaMutex);
+    UnbindMediaSession();
+    g_nowPlaying = {};
+}
+
+NowPlaying ReadNowPlaying() {
+    if (!g_showNowPlaying)
+        return {};
+    std::lock_guard<std::mutex> lock(g_mediaMutex);
+    return g_nowPlaying;
+}
+
+void SkipTrack(bool next) {
+    MediaSession session{nullptr};
+    {
+        std::lock_guard<std::mutex> lock(g_mediaMutex);
+        session = g_mediaSession;
+    }
+    if (!session)
+        return;
+    try {
+        if (next)
+            session.TrySkipNextAsync();
+        else
+            session.TrySkipPreviousAsync();
+    } catch (...) {}
+}
+
+void TogglePlayback() {
+    MediaSession session{nullptr};
+    {
+        std::lock_guard<std::mutex> lock(g_mediaMutex);
+        session = g_mediaSession;
+    }
+    if (!session)
+        return;
+    try {
+        session.TryTogglePlayPauseAsync();
+    } catch (...) {}
+}
 
 void PressKeys(std::initializer_list<WORD> keys) {
     std::vector<INPUT> inputs;
@@ -2272,8 +2535,17 @@ void PressKeys(std::initializer_list<WORD> keys) {
 
 void RunAction(Action action) {
     switch (action) {
+        case kNextTrack:
+            SkipTrack(true);
+            break;
         case kNotifications:
             PressKeys({VK_LWIN, 'N'});
+            break;
+        case kPlayPause:
+            TogglePlayback();
+            break;
+        case kPreviousTrack:
+            SkipTrack(false);
             break;
         case kQuickSettings:
             PressKeys({VK_LWIN, 'A'});
@@ -2507,6 +2779,7 @@ DWORD WINAPI RadioThreadProc(void*) {
     } catch (...) {}
 
     HANDLE wlan = OpenWlan();
+    StartMedia();
 
     winrt::event_token networkToken{};
     bool networkWatched = false;
@@ -2583,6 +2856,7 @@ DWORD WINAPI RadioThreadProc(void*) {
         } catch (...) {}
     }
     CloseWlan(wlan);
+    StopMedia();
     unsubscribe();
     if (key)
         RegCloseKey(key);
@@ -2636,6 +2910,7 @@ struct PaintKey {
     std::wstring time;
     int batteryPercent = -1;
     int acLine = -1;
+    NowPlaying media;
     RadioIcons radios;
     bool saver = false;
     bool percentage = false;
@@ -2646,6 +2921,7 @@ PaintKey CurrentPaintKey() {
     key.percentage = g_showPercentage;
     key.date = DateText();
     key.time = TimeText();
+    key.media = ReadNowPlaying();
     key.radios = ReadRadioIcons();
     SYSTEM_POWER_STATUS ps{};
     if (GetSystemPowerStatus(&ps)) {
@@ -2658,7 +2934,7 @@ PaintKey CurrentPaintKey() {
 
 bool SamePaintKey(PaintKey const& a, PaintKey const& b) {
     return a.date == b.date && a.time == b.time && a.batteryPercent == b.batteryPercent &&
-           a.acLine == b.acLine && a.radios == b.radios && a.saver == b.saver &&
+           a.acLine == b.acLine && a.media == b.media && a.radios == b.radios && a.saver == b.saver &&
            a.percentage == b.percentage;
 }
 
@@ -2925,6 +3201,8 @@ struct BarState {
     bool charging = false;
     std::wstring dateText;
     int level = 100;
+    bool mediaPlaying = false;
+    std::wstring mediaText;
     std::wstring percentText;
     bool showPercentage = false;
     bool showWired = false;
@@ -2940,6 +3218,7 @@ struct BarLayout {
     float clockL = 0;
     float cy = 0;
     float dateL = 0, dateW = 0;
+    float mediaBodyW = 0, mediaL = 0, mediaLabelW = 0, mediaNextL = 0, mediaPrevL = 0, mediaW = 0;
     float networkL = 0, networkW = 0;
     float percentL = 0, percentW = 0;
     float timeL = 0, timeW = 0;
@@ -2951,6 +3230,7 @@ struct TextStyle {
     Gdiplus::StringFormat& fmt;
     Gdiplus::Graphics& g;
     float h;
+    Gdiplus::StringFormat& trimmed;
 
     float Measure(std::wstring const& t) const {
         Gdiplus::RectF box;
@@ -2961,6 +3241,11 @@ struct TextStyle {
     void Draw(std::wstring const& t, float l, float w, float dy,
               Gdiplus::Brush const& brush) const {
         g.DrawString(t.c_str(), -1, &font, Gdiplus::RectF(l, dy, w + 2, h), &fmt, &brush);
+    }
+
+    void DrawTrimmed(std::wstring const& t, float l, float w, float dy,
+                     Gdiplus::Brush const& brush) const {
+        g.DrawString(t.c_str(), -1, &font, Gdiplus::RectF(l, dy, w + 2, h), &trimmed, &brush);
     }
 };
 
@@ -3123,6 +3408,39 @@ void DrawNetwork(DrawContext const& c) {
               90.0f);
 }
 
+void DrawNowPlaying(DrawContext const& c) {
+    BarLayout const& l = c.layout;
+    if (l.mediaW <= 0)
+        return;
+    float u = l.u;
+    auto fade = [](Gdiplus::Color base, double factor) {
+        return Gdiplus::Color((BYTE)(base.GetA() * factor), base.GetR(), base.GetG(), base.GetB());
+    };
+    Gdiplus::SolidBrush textBrush(fade(c.color, c.state.mediaPlaying ? 1.0 : 0.55));
+    c.text.Draw(kNowPlayingLabel, l.mediaL, l.mediaLabelW, c.dy, textBrush);
+
+    float d = kNowPlayingDot * u, gap = kNowPlayingGap * u;
+    float dotX = l.mediaL + l.mediaLabelW + gap, dotY = l.cy - d / 2 + c.dy;
+    Gdiplus::Color dot = c.color;
+    if (c.state.mediaPlaying) {
+        Gdiplus::SolidBrush dotBrush(dot);
+        c.g.FillEllipse(&dotBrush, dotX, dotY, d, d);
+    } else {
+        Gdiplus::Pen dotPen(dot, 1.4f * u);
+        c.g.DrawEllipse(&dotPen, dotX + 0.7f * u, dotY + 0.7f * u, d - 1.4f * u, d - 1.4f * u);
+    }
+    c.text.DrawTrimmed(c.state.mediaText, dotX + d + gap, l.mediaBodyW, c.dy, textBrush);
+
+    float b = kNowPlayingButton * u, half = 4.0f * u, bar = 1.6f * u, cy = l.cy + c.dy;
+    float px = l.mediaPrevL, nx = l.mediaNextL;
+    Gdiplus::PointF prev[] = {{px + b, cy - half}, {px + b, cy + half}, {px + 2.2f * u, cy}};
+    Gdiplus::PointF next[] = {{nx, cy - half}, {nx, cy + half}, {nx + b - 2.2f * u, cy}};
+    c.g.FillRectangle(&textBrush, px, cy - half, bar, 2.0f * half);
+    c.g.FillPolygon(&textBrush, prev, 3);
+    c.g.FillRectangle(&textBrush, nx + b - bar, cy - half, bar, 2.0f * half);
+    c.g.FillPolygon(&textBrush, next, 3);
+}
+
 BarLayout LayoutBar(BarState const& s, TextStyle const& text, float u, int w, int h,
                     std::vector<Item>& items) {
     BarLayout l;
@@ -3154,6 +3472,22 @@ BarLayout LayoutBar(BarState const& s, TextStyle const& text, float u, int w, in
     l.batteryL = (s.airplane ? cursor : l.networkL - 22.0f * u) - l.batteryW;
     l.percentL = l.batteryL - 5.0f * u - l.percentW;
 
+    if (!s.mediaText.empty()) {
+        float leftmost = s.showPercentage ? l.percentL : l.batteryL;
+        float maxW = 2.0f * (leftmost - 24.0f * u - w / 2.0f);
+        float labelW = text.Measure(kNowPlayingLabel);
+        float fixedW = labelW + (2.0f * kNowPlayingGap + kNowPlayingDot) * u;
+        float sideW = 2.0f * (kNowPlayingButton + kNowPlayingButtonGap) * u;
+        if (maxW - fixedW - sideW >= 40.0f * u) {
+            l.mediaBodyW = std::min(text.Measure(s.mediaText), maxW - fixedW - sideW);
+            l.mediaLabelW = labelW;
+            l.mediaW = fixedW + l.mediaBodyW;
+            l.mediaL = (w - l.mediaW) / 2.0f;
+            l.mediaPrevL = l.mediaL - (kNowPlayingButtonGap + kNowPlayingButton) * u;
+            l.mediaNextL = l.mediaL + l.mediaW + kNowPlayingButtonGap * u;
+        }
+    }
+
     auto add = [&](float left, float rightEdge, float padL, float padR, Action action) {
         items.push_back({{(LONG)(left - padL), 0, (LONG)(rightEdge + padR), h}, action});
     };
@@ -3166,6 +3500,11 @@ BarLayout LayoutBar(BarState const& s, TextStyle const& text, float u, int w, in
     if (!s.airplane)
         add(l.networkL, l.networkL + l.networkW, 11 * u, 10.5f * u, kQuickSettings);
     add(l.clockL, right, 11.5f * u, 8 * u, kNotifications);
+    if (l.mediaW > 0) {
+        add(l.mediaL, l.mediaL + l.mediaW, 8 * u, 8 * u, kPlayPause);
+        add(l.mediaPrevL, l.mediaPrevL + kNowPlayingButton * u, 4 * u, 4 * u, kPreviousTrack);
+        add(l.mediaNextL, l.mediaNextL + kNowPlayingButton * u, 4 * u, 4 * u, kNextTrack);
+    }
     return l;
 }
 
@@ -3183,6 +3522,9 @@ BarState ReadBarState() {
 
     SYSTEM_POWER_STATUS ps{};
     bool hasBattery = GetSystemPowerStatus(&ps) && HasBattery(ps);
+    NowPlaying media = ReadNowPlaying();
+    s.mediaPlaying = media.playing;
+    s.mediaText = media.text;
     s.level = hasBattery ? ps.BatteryLifePercent : 100;
     s.charging = hasBattery && ps.ACLineStatus == 1;
     s.showPercentage = hasBattery && g_showPercentage;
@@ -3231,8 +3573,12 @@ void Paint(HWND hwnd) {
             g_clockFontSize = 14.0f * s;
         }
 
+        StringFormat trimmed(&fmt);
+        trimmed.SetFormatFlags(trimmed.GetFormatFlags() | StringFormatFlagsNoWrap);
+        trimmed.SetTrimming(StringTrimmingEllipsisCharacter);
+
         BarState state = ReadBarState();
-        TextStyle text{*g_clockFont, fmt, g, (float)h};
+        TextStyle text{*g_clockFont, fmt, g, (float)h, trimmed};
         BarLayout layout = LayoutBar(state, text, s, w, h, items);
 
         SolidBrush hitBrush(Gdiplus::Color(3, 0, 0, 0));
@@ -3250,6 +3596,7 @@ void Paint(HWND hwnd) {
             DrawAirplane(c);
             DrawNetwork(c);
             DrawClock(c);
+            DrawNowPlaying(c);
         };
         drawAll(Gdiplus::Color(70, 0, 0, 0), 1.0f * s);
         drawAll(Gdiplus::Color(255, 255, 255, 255), 0);
@@ -3317,6 +3664,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+        case kMediaMsg:
         case kRadioMsg:
             RefreshBar(hwnd);
             return 0;
@@ -3478,6 +3826,7 @@ void Start() {
 }
 
 void ReloadSettings() {
+    g_showNowPlaying = Wh_GetIntSetting(L"showNowPlaying") != 0;
     g_showPercentage = Wh_GetIntSetting(L"showBatteryPercentage") != 0;
     if (HWND hwnd = g_wnd.load())
         PostMessage(hwnd, kRadioMsg, 0, 0);
@@ -3817,8 +4166,13 @@ bool QueryIconX(HWND app, HMONITOR monitor, int& x) {
     return best > 0;
 }
 
-int DockX(HWND hwnd, HMONITOR monitor, RECT const& mon) {
+int DockX(HWND hwnd, HMONITOR monitor, RECT const& mon, bool rising) {
     int x = (mon.left + mon.right) / 2;
+    if (rising) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (auto it = g_iconX.find(hwnd); it != g_iconX.end())
+            return it->second;
+    }
     POINT pt;
     GetCursorPos(&pt);
     MONITORINFO cursorMon{sizeof(cursorMon)};
@@ -4129,7 +4483,7 @@ bool Launch(HWND hwnd, bool rising) {
     job->rect = rect;
     job->rising = rising;
     job->w = w;
-    job->dockX = DockX(hwnd, monitor, mi.rcMonitor);
+    job->dockX = DockX(hwnd, monitor, mi.rcMonitor, rising);
 
     HDC screen = GetDC(nullptr);
     if (!screen)
