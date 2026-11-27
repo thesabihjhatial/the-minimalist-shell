@@ -9,6 +9,14 @@
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject -lgdi32 -luser32 -lgdiplus -lshell32 -ladvapi32 -ldwmapi -luuid -lwlanapi
 // ==/WindhawkMod==
 
+// ==WindhawkModSettings==
+/*
+- showBatteryPercentage: false
+  $name: Show battery percentage
+  $description: Shows the charge level as text next to the battery icon in the top bar
+*/
+// ==/WindhawkModSettings==
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -952,12 +960,6 @@ RECT PrimaryMonitorRect() {
 }
 
 int BarHeightPx(HWND hwnd) {
-    RECT tray;
-    if (GetWindowRect(FindWindow(L"Shell_TrayWnd", nullptr), &tray)) {
-        int thickness = std::min<int>(tray.right - tray.left, tray.bottom - tray.top);
-        if (thickness > 1)
-            return thickness / 2;
-    }
     UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 96;
     if (!dpi)
         dpi = 96;
@@ -1290,6 +1292,14 @@ RadioIcons ReadRadioIcons() {
     return g_radioIcons;
 }
 
+std::atomic<bool> g_energySaver{false};
+std::atomic<bool> g_showPercentage{false};
+
+bool SaverActive(SYSTEM_POWER_STATUS const& ps) {
+    return g_energySaver ||
+           (ps.BatteryFlag != 128 && ps.BatteryLifePercent <= 100 && (ps.SystemStatusFlag & 1));
+}
+
 struct PaintKey {
     std::wstring date;
     std::wstring time;
@@ -1297,10 +1307,12 @@ struct PaintKey {
     int acLine = -1;
     RadioIcons radios;
     bool saver = false;
+    bool percentage = false;
 };
 
 PaintKey CurrentPaintKey() {
     PaintKey key;
+    key.percentage = g_showPercentage;
     key.date = DateText();
     key.time = TimeText();
     key.radios = ReadRadioIcons();
@@ -1308,15 +1320,15 @@ PaintKey CurrentPaintKey() {
     if (GetSystemPowerStatus(&ps)) {
         key.batteryPercent = ps.BatteryLifePercent;
         key.acLine = ps.ACLineStatus;
-        key.saver = ps.BatteryFlag != 128 && ps.BatteryLifePercent <= 100 &&
-                    (ps.SystemStatusFlag & 1);
     }
+    key.saver = SaverActive(ps);
     return key;
 }
 
 bool SamePaintKey(PaintKey const& a, PaintKey const& b) {
     return a.date == b.date && a.time == b.time && a.batteryPercent == b.batteryPercent &&
-           a.acLine == b.acLine && a.radios == b.radios && a.saver == b.saver;
+           a.acLine == b.acLine && a.radios == b.radios && a.saver == b.saver &&
+           a.percentage == b.percentage;
 }
 
 PaintKey g_paintKey;
@@ -1653,6 +1665,13 @@ void Paint(HWND hwnd) {
         int wifiLevel = radios.wifiLevel;
         bool wired = radios.wired;
         bool showWired = radios.wired || !radios.hasWifi;
+        SYSTEM_POWER_STATUS ps{};
+        bool hasBattery = GetSystemPowerStatus(&ps) && ps.BatteryFlag != 128 &&
+                          ps.BatteryLifePercent <= 100;
+        int level = hasBattery ? ps.BatteryLifePercent : 100;
+        bool showPercentage = hasBattery && g_showPercentage;
+        std::wstring percentText = std::to_wstring(level) + L"%";
+        float percentW = showPercentage ? measure(percentText, cf) : 0.0f;
         float cursor = clockL - 23.0f * u;
         float apR = 0, apW = 12.0f * u, apL = 0;
         if (airplane) {
@@ -1676,7 +1695,8 @@ void Paint(HWND hwnd) {
             addItem(apL, apR, 8 * u, 11 * u, kQuickSettings);
         if (bluetooth)
             addItem(blL, blR, 11 * u, 11 * u, kQuickSettings);
-        addItem(btL, btR, 8 * u, 11 * u, kQuickSettings);
+        float percentL = btL - 5.0f * u - percentW;
+        addItem(showPercentage ? percentL : btL, btR, 8 * u, 11 * u, kQuickSettings);
         if (!airplane)
             addItem(wfL, wfR, 11 * u, 10.5f * u, kQuickSettings);
         addItem(clockL, right, 11.5f * u, 8 * u, kNotifications);
@@ -1689,17 +1709,13 @@ void Paint(HWND hwnd) {
                                                  (REAL)(item.rc.bottom - item.rc.top)));
         }
 
-        SYSTEM_POWER_STATUS ps{};
-        bool hasBattery = GetSystemPowerStatus(&ps) && ps.BatteryFlag != 128 &&
-                          ps.BatteryLifePercent <= 100;
-        int level = hasBattery ? ps.BatteryLifePercent : 100;
         bool charging = hasBattery && ps.ACLineStatus == 1;
-        bool saver = hasBattery && (ps.SystemStatusFlag & 1);
+        bool saver = SaverActive(ps);
         Gdiplus::Color batteryColor(255, 255, 255, 255);
-        if (level <= 20)
-            batteryColor = Gdiplus::Color(255, 255, 69, 58);
-        else if (saver)
+        if (saver)
             batteryColor = Gdiplus::Color(255, 255, 214, 10);
+        else if (level <= 20)
+            batteryColor = Gdiplus::Color(255, 255, 69, 58);
         else if (charging)
             batteryColor = Gdiplus::Color(255, 52, 199, 89);
 
@@ -1730,10 +1746,6 @@ void Paint(HWND hwnd) {
                 GraphicsPath body;
                 roundRect(body, x, y, bodyW, bodyH, 3.5f * u);
                 g.FillPath(&faintBrush, &body);
-                if (color.GetA() == 255) {
-                    Pen outline(Gdiplus::Color(255, 255, 255, 255), 1.0f * u);
-                    g.DrawPath(&outline, &body);
-                }
                 float inset = 1.5f * u;
                 float fillW = (bodyW - 2 * inset) * level / 100.0f;
                 if (fillW > 0) {
@@ -1742,12 +1754,29 @@ void Paint(HWND hwnd) {
                     SolidBrush levelBrush(color.GetA() == 255 ? batteryColor : color);
                     g.FillPath(&levelBrush, &fill);
                 }
+                if (charging && color.GetA() == 255) {
+                    float bx = x + bodyW / 2, by = y + bodyH / 2;
+                    static const float k[][2] = {{1.3f, -4.2f}, {-2.3f, 0.7f}, {-0.2f, 0.7f},
+                                                 {-1.3f, 4.2f}, {2.3f, -0.7f}, {0.2f, -0.7f}};
+                    PointF bolt[6];
+                    for (int i = 0; i < 6; i++)
+                        bolt[i] = PointF(bx + k[i][0] * 1.25f * u, by + k[i][1] * 1.25f * u);
+                    Pen boltEdge(Gdiplus::Color(140, 0, 0, 0), 0.8f * u);
+                    boltEdge.SetLineJoin(LineJoinRound);
+                    SolidBrush boltFill(Gdiplus::Color(255, 255, 255, 255));
+                    g.DrawPolygon(&boltEdge, bolt, 6);
+                    g.FillPolygon(&boltFill, bolt, 6);
+                }
                 GraphicsPath cap;
                 roundRect(cap, x + bodyW + 0.7f * u, cy - 2.2f * u + dy, 1.3f * u, 4.4f * u,
                           0.65f * u);
                 g.FillPath(&faintBrush, &cap);
                 g.ResetTransform();
             }
+
+            if (showPercentage)
+                g.DrawString(percentText.c_str(), -1, &cf,
+                             RectF(percentL, dy, percentW + 2, (REAL)h), &fmt, &brush);
 
             if (bluetooth) {
                 Pen pen(bluetoothConnected ? color : faint, 1.4f * u);
@@ -1885,6 +1914,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RefreshBar(hwnd);
             return 0;
         case WM_POWERBROADCAST:
+            if (wParam == PBT_POWERSETTINGCHANGE) {
+                auto* setting = (POWERBROADCAST_SETTING*)lParam;
+                if (setting && IsEqualGUID(setting->PowerSetting, kPowerSavingGuid) &&
+                    setting->DataLength >= sizeof(DWORD))
+                    g_energySaver = *(DWORD*)setting->Data != 0;
+            }
             RefreshBar(hwnd);
             return TRUE;
         case WM_TIMECHANGE:
@@ -2034,6 +2069,12 @@ void Start() {
     if (g_thread)
         return;
     g_thread = CreateThread(nullptr, 0, ThreadProc, nullptr, 0, nullptr);
+}
+
+void ReloadSettings() {
+    g_showPercentage = Wh_GetIntSetting(L"showBatteryPercentage") != 0;
+    if (HWND hwnd = g_wnd.load())
+        PostMessage(hwnd, kRadioMsg, 0, 0);
 }
 
 bool Stop() {
@@ -2892,9 +2933,16 @@ bool InitShell() {
     return true;
 }
 
+void Wh_ModSettingsChanged() {
+    if (g_shellActive)
+        TopBar::ReloadSettings();
+}
+
 BOOL Wh_ModInit() {
     HookGenie();
     g_shellActive = IsExplorerProcess() && InitShell();
+    if (g_shellActive)
+        TopBar::ReloadSettings();
     return TRUE;
 }
 
