@@ -14,6 +14,9 @@
 - showBatteryPercentage: false
   $name: Show battery percentage
   $description: Shows charge level as text, next to the battery icon in the top bar
+- translucency: 100
+  $name: Translucency
+  $description: How see-through the Start menu, Search and taskbar flyouts are from 0 (opaque) to 100 (clearest). Explorer windows and menus always use system acrylic.
 */
 // ==/WindhawkModSettings==
 
@@ -54,6 +57,9 @@
 #endif
 #ifndef DWMWA_BORDER_COLOR
 #define DWMWA_BORDER_COLOR 34
+#endif
+#ifndef DWMWA_COLOR_DEFAULT
+#define DWMWA_COLOR_DEFAULT 0xFFFFFFFF
 #endif
 #ifndef DWMWA_EXTENDED_FRAME_BOUNDS
 #define DWMWA_EXTENDED_FRAME_BOUNDS 9
@@ -914,11 +920,17 @@ struct Saved {
     MARGINS margins{};
 };
 
+using ThemeName = std::array<WCHAR, 255>;
+
 constexpr WCHAR kAppliedProp[] = L"MinimalistTranslucent";
 constexpr int kBackdropAcrylic = DWMSBT_TRANSIENTWINDOW;
+constexpr int kMenuPopupItemFocusable = 27;
 constexpr WCHAR kPersonalizeKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+constexpr COLORREF kRimDark = RGB(0x80, 0x80, 0x80);
+constexpr COLORREF kRimLight = RGB(0xFF, 0xFF, 0xFF);
 
+using BeginPaint_t = decltype(&BeginPaint);
 using DrawTextWithGlow_t = HRESULT(WINAPI*)(HDC, LPWSTR, UINT, RECT*, DWORD, COLORREF, COLORREF,
                                             UINT, UINT, BOOL, DTT_CALLBACK_PROC, LPARAM);
 using DrawThemeBackground_t = decltype(&DrawThemeBackground);
@@ -927,6 +939,7 @@ using DrawThemeText_t = decltype(&DrawThemeText);
 using DrawThemeTextEx_t = decltype(&DrawThemeTextEx);
 using DwmExtendFrameIntoClientArea_t = decltype(&DwmExtendFrameIntoClientArea);
 using DwmSetWindowAttribute_t = decltype(&DwmSetWindowAttribute);
+using EndPaint_t = decltype(&EndPaint);
 using ExtTextOutW_t = decltype(&ExtTextOutW);
 using FillRect_t = decltype(&FillRect);
 using GetSysColor_t = decltype(&GetSysColor);
@@ -936,6 +949,7 @@ using NtUserCreateWindowEx_t = HWND(WINAPI*)(DWORD, PVOID, LPCWSTR, PVOID, DWORD
                                              LONG, LONG, HWND, HMENU, HINSTANCE, LPVOID, DWORD,
                                              DWORD, DWORD, VOID*);
 
+BeginPaint_t BeginPaint_Original;
 DrawTextWithGlow_t DrawTextWithGlow_Original;
 DrawThemeBackground_t DrawThemeBackground_Original;
 DrawThemeBackgroundEx_t DrawThemeBackgroundEx_Original;
@@ -943,6 +957,7 @@ DrawThemeText_t DrawThemeText_Original;
 DrawThemeTextEx_t DrawThemeTextEx_Original;
 DwmExtendFrameIntoClientArea_t DwmExtendFrameIntoClientArea_Original;
 DwmSetWindowAttribute_t DwmSetWindowAttribute_Original;
+EndPaint_t EndPaint_Original;
 ExtTextOutW_t ExtTextOutW_Original;
 FillRect_t FillRect_Original;
 GetSysColor_t GetSysColor_Original;
@@ -954,8 +969,22 @@ std::array<HBRUSH, COLOR_MENUBAR + 1> g_brushes{};
 std::mutex g_brushMutex;
 std::atomic<bool> g_dark{false};
 bool g_explorer = false;
+thread_local HWND g_painting = nullptr;
 std::unordered_map<HWND, Saved> g_saved;
 std::mutex g_savedMutex;
+int g_translucency = 100;
+
+int ReadTranslucency() {
+    return std::clamp(Wh_GetIntSetting(L"translucency"), 0, 100);
+}
+
+bool TranslucencyChanged() {
+    return ReadTranslucency() != g_translucency;
+}
+
+double Opacity() {
+    return (100 - g_translucency) / 100.0;
+}
 
 std::array<BYTE, 256> BuildTextGamma() {
     std::array<BYTE, 256> lut{};
@@ -1017,24 +1046,23 @@ bool IsGlassWindow(HWND hwnd) {
            (style & (WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME));
 }
 
-std::wstring ThemeClass(HTHEME theme) {
+std::wstring_view ThemeClass(HTHEME theme, ThemeName& name) {
     using GetClass_t = HRESULT(WINAPI*)(HTHEME, LPWSTR, int);
     static auto getClass =
         (GetClass_t)GetProcAddress(GetModuleHandle(L"uxtheme.dll"), MAKEINTRESOURCEA(74));
-    WCHAR name[255]{};
-    if (!getClass || FAILED(getClass(theme, name, ARRAYSIZE(name))))
+    if (!getClass || FAILED(getClass(theme, name.data(), (int)name.size())))
         return {};
-    return name;
+    return name.data();
 }
 
 HRESULT ExtendFrame(HWND hwnd, MARGINS const& margins) {
-    auto extend = DwmExtendFrameIntoClientArea_Original ? DwmExtendFrameIntoClientArea_Original
-                                                        : DwmExtendFrameIntoClientArea;
-    return extend(hwnd, &margins);
+    return DwmExtendFrameIntoClientArea_Original(hwnd, &margins);
 }
 
 bool IsGlassDC(HDC hdc) {
     HWND hwnd = WindowFromDC(hdc);
+    if (!hwnd)
+        hwnd = g_painting;
     return !hwnd || IsApplied(GetAncestor(hwnd, GA_ROOT));
 }
 
@@ -1059,35 +1087,46 @@ HRESULT SetAttribute(HWND hwnd, DWORD attribute, int value) {
     return set(hwnd, attribute, &value, sizeof(value));
 }
 
-void ApplySurface(HWND hwnd) {
+void Glaze(HWND hwnd) {
+    SetAttribute(hwnd, DWMWA_BORDER_COLOR, (int)(g_dark ? kRimDark : kRimLight));
+    SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, kBackdropAcrylic);
+}
+
+bool Claim(HWND hwnd) {
     if (g_unloading || IsApplied(hwnd))
-        return;
+        return false;
     SetProp(hwnd, kAppliedProp, (HANDLE)1);
+    Saved saved;
+    int backdrop = DWMSBT_AUTO;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop,
+                                        sizeof(backdrop))))
+        saved.backdrop = backdrop;
+    {
+        std::lock_guard<std::mutex> lock(g_savedMutex);
+        g_saved[hwnd] = saved;
+    }
     if (g_dark)
         SetAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, TRUE);
+    return true;
+}
+
+void ApplySurface(HWND hwnd) {
+    if (!Claim(hwnd))
+        return;
     DWM_BLURBEHIND blur{DWM_BB_ENABLE | DWM_BB_BLURREGION | DWM_BB_TRANSITIONONMAXIMIZED, TRUE,
                         CreateRectRgn(0, 0, -1, -1), TRUE};
     DwmEnableBlurBehindWindow(hwnd, &blur);
     DeleteObject(blur.hRgnBlur);
     DefWindowProcW(hwnd, WM_NCACTIVATE, TRUE, 0);
-    SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, kBackdropAcrylic);
     SetAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND);
+    Glaze(hwnd);
 }
 
 void ApplyWindow(HWND hwnd) {
-    if (g_unloading || IsApplied(hwnd))
+    if (!Claim(hwnd))
         return;
-    SetProp(hwnd, kAppliedProp, (HANDLE)1);
-    int backdrop = DWMSBT_AUTO;
-    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop,
-                                        sizeof(backdrop)))) {
-        std::lock_guard<std::mutex> lock(g_savedMutex);
-        g_saved[hwnd].backdrop = backdrop;
-    }
-    if (g_dark)
-        SetAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, TRUE);
-    SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, kBackdropAcrylic);
     ExtendFrame(hwnd, {-1, -1, -1, -1});
+    Glaze(hwnd);
 }
 
 void Apply(HWND hwnd) {
@@ -1097,23 +1136,29 @@ void Apply(HWND hwnd) {
         ApplyWindow(hwnd);
 }
 
+void Forget(HWND hwnd) {
+    std::lock_guard<std::mutex> lock(g_savedMutex);
+    g_saved.erase(hwnd);
+}
+
 void Restore(HWND hwnd) {
     if (!IsApplied(hwnd))
         return;
     RemoveProp(hwnd, kAppliedProp);
-    if (IsSurface(hwnd)) {
-        DWM_BLURBEHIND blur{DWM_BB_ENABLE, FALSE, nullptr, FALSE};
-        DwmEnableBlurBehindWindow(hwnd, &blur);
-        SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_NONE);
-        return;
-    }
     Saved saved;
     {
         std::lock_guard<std::mutex> lock(g_savedMutex);
-        if (auto it = g_saved.find(hwnd); it != g_saved.end())
-            saved = it->second;
+        if (auto node = g_saved.extract(hwnd))
+            saved = node.mapped();
     }
+    SetAttribute(hwnd, DWMWA_BORDER_COLOR, (int)DWMWA_COLOR_DEFAULT);
     SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, saved.backdrop);
+    if (IsSurface(hwnd)) {
+        DWM_BLURBEHIND blur{DWM_BB_ENABLE, FALSE, nullptr, FALSE};
+        DwmEnableBlurBehindWindow(hwnd, &blur);
+        SetAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT);
+        return;
+    }
     ExtendFrame(hwnd, saved.margins);
     Refresh(hwnd);
 }
@@ -1162,11 +1207,12 @@ COLORREF GlassSysColor(int index) {
     return GetSysColor_Original(index);
 }
 
-bool IsClearPart(std::wstring const& theme, int part, int state) {
+bool IsClearPart(std::wstring_view theme, int part, int state) {
     if (theme == L"Menu")
         return part == MENU_POPUPBACKGROUND || part == MENU_POPUPBORDERS ||
                part == MENU_POPUPGUTTER || part == MENU_POPUPCHECKBACKGROUND ||
-               ((part == MENU_POPUPITEM || part == 27) && state != MPI_HOT) ||
+               ((part == MENU_POPUPITEM || part == kMenuPopupItemFocusable) &&
+                state != MPI_HOT) ||
                (g_explorer && (part == MENU_BARBACKGROUND ||
                                (part == MENU_BARITEM && state == MBI_NORMAL)));
     if (theme == L"Tooltip")
@@ -1208,7 +1254,7 @@ bool IsClearPart(std::wstring const& theme, int part, int state) {
     return false;
 }
 
-bool ExplorerThemeColor(std::wstring const& theme, int part, int state, int prop, HRESULT hr,
+bool ExplorerThemeColor(std::wstring_view theme, int part, int state, int prop, HRESULT hr,
                         COLORREF* color) {
     bool dark = g_dark;
     bool groupHeader = theme == L"ListView" && part == LVP_GROUPHEADER;
@@ -1248,6 +1294,11 @@ bool IsNearBlack(HBRUSH brush) {
         return false;
     return GetRValue(info.lbColor) <= 0x20 && GetGValue(info.lbColor) <= 0x20 &&
            GetBValue(info.lbColor) <= 0x20;
+}
+
+void ClearGlass(HDC hdc, RECT const& rect) {
+    auto fill = FillRect_Original ? FillRect_Original : FillRect;
+    fill(hdc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
 }
 
 bool ShouldComposeText(HDC hdc, UINT options, LPCRECT rect, LPCWSTR text, UINT count) {
@@ -1338,6 +1389,11 @@ bool ComposeText(HDC hdc, HPAINTBUFFER buffer, RECT const& bounds) {
     return true;
 }
 
+HDC WINAPI BeginPaint_Hook(HWND hwnd, LPPAINTSTRUCT paint) {
+    g_painting = hwnd;
+    return BeginPaint_Original(hwnd, paint);
+}
+
 HRESULT WINAPI DrawTextWithGlow_Hook(HDC hdc, LPWSTR text, UINT count, RECT* rect, DWORD flags,
                                      COLORREF textColor, COLORREF glowColor, UINT glowRadius,
                                      UINT glowIntensity, BOOL premultiply,
@@ -1353,7 +1409,7 @@ HRESULT WINAPI DrawTextWithGlow_Hook(HDC hdc, LPWSTR text, UINT count, RECT* rec
     return DrawTextW(hdc, text, count, rect, flags & ~DT_MODIFYSTRING) ? S_OK : E_FAIL;
 }
 
-BYTE HighlightAlpha(std::wstring const& theme, int part, int state) {
+BYTE HighlightAlpha(std::wstring_view theme, int part, int state) {
     if (!g_explorer || theme != L"TreeView" || part != TVP_TREEITEM)
         return 0;
     switch (state) {
@@ -1425,7 +1481,7 @@ void PaintRounded(HDC hdc, RECT const& shape, RECT const& clip, BYTE alpha, floa
 }
 
 void PaintThumb(HDC hdc, int part, int state, RECT const& shape, RECT const& area) {
-    FillRect(hdc, &area, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    ClearGlass(hdc, area);
     BYTE alpha = ThumbAlpha(state);
     if (!alpha)
         return;
@@ -1450,7 +1506,8 @@ bool PaintGlassPart(HTHEME theme, HDC hdc, int part, int state, RECT const& shap
                     RECT const& area) {
     if (g_unloading)
         return false;
-    std::wstring name = ThemeClass(theme);
+    ThemeName buffer;
+    std::wstring_view name = ThemeClass(theme, buffer);
     if (BYTE alpha = HighlightAlpha(name, part, state)) {
         PaintRounded(hdc, shape, area, alpha, 4.0f * DcScale(hdc));
         return true;
@@ -1464,7 +1521,7 @@ bool PaintGlassPart(HTHEME theme, HDC hdc, int part, int state, RECT const& shap
         return false;
     if (HWND hwnd = WindowFromDC(hdc); hwnd && IsSurface(hwnd))
         ApplySurface(hwnd);
-    FillRect(hdc, &area, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    ClearGlass(hdc, area);
     return true;
 }
 
@@ -1498,7 +1555,8 @@ HRESULT WINAPI DrawThemeTextEx_Hook(HTHEME theme, HDC hdc, int part, int state, 
         return DrawThemeTextEx_Original(theme, hdc, part, state, text, count, flags, rect,
                                         options);
     DTTOPTS themed = options ? *options : DTTOPTS{sizeof(DTTOPTS)};
-    if (SUCCEEDED(GetThemeColor(theme, part, state, TMT_TEXTCOLOR, &themed.crText)))
+    if (!(themed.dwFlags & DTT_TEXTCOLOR) &&
+        SUCCEEDED(GetThemeColor(theme, part, state, TMT_TEXTCOLOR, &themed.crText)))
         themed.dwFlags |= DTT_TEXTCOLOR;
     return DrawThemeTextEx_Original(theme, hdc, part, state, text, count, flags, rect, &themed);
 }
@@ -1531,6 +1589,11 @@ HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd, DWORD attribute, LPCVOID va
     return SetAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, kBackdropAcrylic);
 }
 
+BOOL WINAPI EndPaint_Hook(HWND hwnd, PAINTSTRUCT const* paint) {
+    g_painting = nullptr;
+    return EndPaint_Original(hwnd, paint);
+}
+
 BOOL WINAPI ExtTextOutW_Hook(HDC hdc, int x, int y, UINT options, RECT const* rect,
                              LPCWSTR text, UINT count, INT const* dx) {
     RECT bounds{};
@@ -1556,14 +1619,15 @@ BOOL WINAPI ExtTextOutW_Hook(HDC hdc, int x, int y, UINT options, RECT const* re
 }
 
 BOOL WINAPI FillRect_Hook(HDC hdc, RECT const* rect, HBRUSH brush) {
-    if (g_unloading)
+    if (g_unloading || !rect)
         return FillRect_Original(hdc, rect, brush);
     ULONG_PTR index = (ULONG_PTR)brush - 1;
     if (index <= COLOR_MENUBAR)
         brush = GetSysColorBrush((int)index);
-    else if (IsNearBlack(brush) && IsGlassDC(hdc))
-        brush = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    return FillRect_Original(hdc, rect, brush);
+    if (!IsNearBlack(brush) || !IsGlassDC(hdc))
+        return FillRect_Original(hdc, rect, brush);
+    ClearGlass(hdc, *rect);
+    return TRUE;
 }
 
 DWORD WINAPI GetSysColor_Hook(int index) {
@@ -1573,10 +1637,13 @@ DWORD WINAPI GetSysColor_Hook(int index) {
 HBRUSH WINAPI GetSysColorBrush_Hook(int index) {
     if (g_unloading || index < 0 || index > COLOR_MENUBAR)
         return GetSysColorBrush_Original(index);
+    COLORREF color = GlassSysColor(index);
+    if (color == GetSysColor_Original(index))
+        return GetSysColorBrush_Original(index);
     std::lock_guard<std::mutex> lock(g_brushMutex);
     HBRUSH& brush = g_brushes[index];
     if (!brush || GetObjectType(brush) != OBJ_BRUSH)
-        brush = CreateSolidBrush(GlassSysColor(index));
+        brush = CreateSolidBrush(color);
     return brush;
 }
 
@@ -1584,11 +1651,13 @@ HRESULT WINAPI GetThemeColor_Hook(HTHEME theme, int part, int state, int prop, C
     HRESULT hr = GetThemeColor_Original(theme, part, state, prop, color);
     if (g_unloading || !color)
         return hr;
-    std::wstring name = ThemeClass(theme);
+    ThemeName buffer;
+    std::wstring_view name = ThemeClass(theme, buffer);
     if (name == L"Menu" || name == L"Tooltip") {
         bool text = prop == TMT_TEXTCOLOR &&
                     (name == L"Tooltip" ? part == TTP_STANDARD || part == TTP_BALLOON
-                                        : (part == MENU_POPUPITEM || part == 27 ||
+                                        : (part == MENU_POPUPITEM ||
+                                           part == kMenuPopupItemFocusable ||
                                            (g_explorer && part == MENU_BARITEM)) &&
                                               state != MPI_DISABLED && state != MPI_DISABLEDHOT);
         if (text && g_dark)
@@ -1617,24 +1686,33 @@ HWND WINAPI NtUserCreateWindowEx_Hook(DWORD exStyle, PVOID className, LPCWSTR ve
     return hwnd;
 }
 
-void ApplyExisting() {
+template <typename F>
+void ForEachOwnWindow(F fn) {
     EnumWindows(
-        [](HWND hwnd, LPARAM) -> BOOL {
+        [](HWND hwnd, LPARAM param) -> BOOL {
             DWORD pid = 0;
             GetWindowThreadProcessId(hwnd, &pid);
-            if (pid == GetCurrentProcessId() && !IsApplied(hwnd)) {
-                Apply(hwnd);
-                if (IsApplied(hwnd) && !IsSurface(hwnd))
-                    Refresh(hwnd);
-            }
+            if (pid == GetCurrentProcessId())
+                (*(F*)param)(hwnd);
             return TRUE;
         },
-        0);
+        (LPARAM)&fn);
+}
+
+void ApplyExisting() {
+    ForEachOwnWindow([](HWND hwnd) {
+        if (IsApplied(hwnd))
+            return;
+        Apply(hwnd);
+        if (IsApplied(hwnd) && !IsSurface(hwnd))
+            Refresh(hwnd);
+    });
 }
 
 void Install(bool explorer) {
     g_dark = IsDarkMode();
     g_explorer = explorer;
+    g_translucency = ReadTranslucency();
     if (auto create = (NtUserCreateWindowEx_t)GetProcAddress(GetModuleHandle(L"win32u.dll"),
                                                              "NtUserCreateWindowEx"))
         WindhawkUtils::SetFunctionHook(create, NtUserCreateWindowEx_Hook,
@@ -1644,6 +1722,7 @@ void Install(bool explorer) {
     WindhawkUtils::SetFunctionHook(GetThemeColor, GetThemeColor_Hook, &GetThemeColor_Original);
     if (!explorer)
         return;
+    WindhawkUtils::SetFunctionHook(BeginPaint, BeginPaint_Hook, &BeginPaint_Original);
     if (auto glow = (DrawTextWithGlow_t)GetProcAddress(GetModuleHandle(L"uxtheme.dll"),
                                                        MAKEINTRESOURCEA(126)))
         WindhawkUtils::SetFunctionHook(glow, DrawTextWithGlow_Hook, &DrawTextWithGlow_Original);
@@ -1657,6 +1736,7 @@ void Install(bool explorer) {
                                    &DwmExtendFrameIntoClientArea_Original);
     WindhawkUtils::SetFunctionHook(DwmSetWindowAttribute, DwmSetWindowAttribute_Hook,
                                    &DwmSetWindowAttribute_Original);
+    WindhawkUtils::SetFunctionHook(EndPaint, EndPaint_Hook, &EndPaint_Original);
     WindhawkUtils::SetFunctionHook(ExtTextOutW, ExtTextOutW_Hook, &ExtTextOutW_Original);
     WindhawkUtils::SetFunctionHook(FillRect, FillRect_Hook, &FillRect_Original);
     WindhawkUtils::SetFunctionHook(GetSysColor, GetSysColor_Hook, &GetSysColor_Original);
@@ -1667,21 +1747,19 @@ void Install(bool explorer) {
 void RefreshTheme(LPARAM lParam) {
     if (!lParam || wcscmp((LPCWSTR)lParam, L"ImmersiveColorSet") != 0)
         return;
-    g_dark = IsDarkMode();
-    std::lock_guard<std::mutex> lock(g_brushMutex);
-    g_brushes.fill(nullptr);
+    bool dark = IsDarkMode();
+    if (g_dark.exchange(dark) == dark)
+        return;
+    ForEachOwnWindow([dark](HWND hwnd) {
+        if (!IsApplied(hwnd))
+            return;
+        SetAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, dark);
+        Glaze(hwnd);
+    });
 }
 
 void Uninstall() {
-    EnumWindows(
-        [](HWND hwnd, LPARAM) -> BOOL {
-            DWORD pid = 0;
-            GetWindowThreadProcessId(hwnd, &pid);
-            if (pid == GetCurrentProcessId())
-                Restore(hwnd);
-            return TRUE;
-        },
-        0);
+    ForEachOwnWindow(Restore);
     std::lock_guard<std::mutex> lock(g_savedMutex);
     g_saved.clear();
 }
@@ -1689,11 +1767,13 @@ void Uninstall() {
 
 namespace XamlGlass {
 enum Framework { kNone, kSystem, kWinUI };
+enum Role { kBackground, kBorder };
 
-constexpr double kAcrylicLuminosity = 0.35;
-constexpr double kAcrylicTint = 0.25;
+constexpr double kAcrylicLuminosity = 0.2;
+constexpr double kAcrylicTint = 0.0;
 constexpr BYTE kOpaqueAlpha = 0xB0;
 constexpr int kNeutralSpread = 12;
+constexpr BYTE kRimAlpha = 0x66;
 constexpr CLSID kWatcherClsid = {
     0x8f3b1c2a, 0x6d4e, 0x4b7a, {0x9e, 0x51, 0x2c, 0x7d, 0x3a, 0x60, 0xf4, 0x18}};
 
@@ -1711,9 +1791,18 @@ bool IsSkippedAncestor(std::wstring_view name) {
     return false;
 }
 
+bool IsNeutral(winrt::Windows::UI::Color color) {
+    return std::max({color.R, color.G, color.B}) - std::min({color.R, color.G, color.B}) <=
+           kNeutralSpread;
+}
+
 bool IsSolidSurface(winrt::Windows::UI::Color color, double opacity) {
-    int spread = std::max({color.R, color.G, color.B}) - std::min({color.R, color.G, color.B});
-    return color.A * opacity >= kOpaqueAlpha && spread <= kNeutralSpread;
+    return color.A * opacity >= kOpaqueAlpha && IsNeutral(color);
+}
+
+bool IsStroke(winrt::Windows::UI::Color color, double opacity) {
+    double alpha = color.A * opacity;
+    return alpha > 0 && alpha < kOpaqueAlpha && IsNeutral(color);
 }
 
 struct SystemXaml {
@@ -1727,6 +1816,7 @@ struct SystemXaml {
     using DependencyProperty = winrt::Windows::UI::Xaml::DependencyProperty;
     using Dispatcher = winrt::Windows::UI::Core::CoreDispatcher;
     using FrameworkElement = winrt::Windows::UI::Xaml::FrameworkElement;
+    using Grid = winrt::Windows::UI::Xaml::Controls::Grid;
     using Panel = winrt::Windows::UI::Xaml::Controls::Panel;
     using SolidColorBrush = winrt::Windows::UI::Xaml::Media::SolidColorBrush;
     using VisualTreeHelper = winrt::Windows::UI::Xaml::Media::VisualTreeHelper;
@@ -1745,16 +1835,15 @@ struct SystemXaml {
 };
 
 struct WinUIXaml {
-    using AcrylicBrush = winrt::Microsoft::UI::Xaml::Media::AcrylicBrush;
     using Border = winrt::Microsoft::UI::Xaml::Controls::Border;
     using Brush = winrt::Microsoft::UI::Xaml::Media::Brush;
-    using CompositionBrush = winrt::Microsoft::UI::Xaml::Media::XamlCompositionBrushBase;
     using ContentPresenter = winrt::Microsoft::UI::Xaml::Controls::ContentPresenter;
     using Control = winrt::Microsoft::UI::Xaml::Controls::Control;
     using DependencyObject = winrt::Microsoft::UI::Xaml::DependencyObject;
     using DependencyProperty = winrt::Microsoft::UI::Xaml::DependencyProperty;
     using Dispatcher = winrt::Microsoft::UI::Dispatching::DispatcherQueue;
     using FrameworkElement = winrt::Microsoft::UI::Xaml::FrameworkElement;
+    using Grid = winrt::Microsoft::UI::Xaml::Controls::Grid;
     using Panel = winrt::Microsoft::UI::Xaml::Controls::Panel;
     using SolidColorBrush = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush;
     using VisualTreeHelper = winrt::Microsoft::UI::Xaml::Media::VisualTreeHelper;
@@ -1778,6 +1867,7 @@ struct WinUIXaml {
 template <typename X>
 struct Glass {
     struct Entry {
+        Inspectable applied{nullptr};
         typename X::DependencyProperty dp{nullptr};
         winrt::weak_ref<typename X::FrameworkElement> element;
         Inspectable original{nullptr};
@@ -1785,28 +1875,52 @@ struct Glass {
         int64_t token = 0;
     };
 
+    using Key = std::pair<void*, Role>;
+
+    struct KeyHash {
+        size_t operator()(Key const& key) const {
+            return std::hash<void*>()(key.first) ^ (size_t)key.second;
+        }
+    };
+
     static inline std::unordered_map<DWORD, typename X::Dispatcher> dispatchers;
-    static inline std::unordered_map<void*, Entry> entries;
+    static inline std::unordered_map<Key, Entry, KeyHash> entries;
     static inline std::mutex mutex;
 
-    static typename X::DependencyProperty BackgroundProperty(
-        typename X::FrameworkElement const& element) {
-        if (element.template try_as<typename X::Panel>())
-            return X::Panel::BackgroundProperty();
+    static typename X::DependencyProperty PropertyOf(typename X::FrameworkElement const& element,
+                                                     Role role) {
+        bool border = role == kBorder;
         if (element.template try_as<typename X::Border>())
-            return X::Border::BackgroundProperty();
+            return border ? X::Border::BorderBrushProperty() : X::Border::BackgroundProperty();
         if (element.template try_as<typename X::Control>())
-            return X::Control::BackgroundProperty();
+            return border ? X::Control::BorderBrushProperty() : X::Control::BackgroundProperty();
         if (element.template try_as<typename X::ContentPresenter>())
-            return X::ContentPresenter::BackgroundProperty();
+            return border ? X::ContentPresenter::BorderBrushProperty()
+                          : X::ContentPresenter::BackgroundProperty();
+        if (element.template try_as<typename X::Grid>())
+            return border ? X::Grid::BorderBrushProperty() : X::Panel::BackgroundProperty();
+        if (element.template try_as<typename X::Panel>())
+            return border ? nullptr : X::Panel::BackgroundProperty();
         return nullptr;
     }
 
+    static typename X::Brush SharedBrush(winrt::Windows::UI::Color color) {
+        static thread_local std::unordered_map<UINT32, typename X::SolidColorBrush> brushes;
+        UINT32 key = (UINT32)color.A << 24 | color.R << 16 | color.G << 8 | color.B;
+        auto& brush = brushes[key];
+        if (!brush)
+            brush = typename X::SolidColorBrush(color);
+        return brush;
+    }
+
     static typename X::Brush ClearBrush() {
-        static thread_local typename X::SolidColorBrush clear{nullptr};
-        if (!clear)
-            clear = typename X::SolidColorBrush(winrt::Windows::UI::Color{0, 0, 0, 0});
-        return clear;
+        return SharedBrush({0, 0, 0, 0});
+    }
+
+    static typename X::Brush RimBrush(typename X::SolidColorBrush const& solid) {
+        if (!IsStroke(solid.Color(), solid.Opacity()))
+            return nullptr;
+        return SharedBrush({kRimAlpha, 0xFF, 0xFF, 0xFF});
     }
 
     static typename X::Brush LightAcrylic(typename X::Brush const& brush) {
@@ -1815,9 +1929,6 @@ struct Glass {
                 return nullptr;
             typename X::AcrylicBrush light;
             if (auto acrylic = brush.template try_as<typename X::AcrylicBrush>()) {
-                auto luminosity = acrylic.TintLuminosityOpacity();
-                if (luminosity && luminosity.Value() == kAcrylicLuminosity)
-                    return nullptr;
                 light.BackgroundSource(acrylic.BackgroundSource());
                 light.FallbackColor(acrylic.FallbackColor());
                 light.TintColor(acrylic.TintColor());
@@ -1829,18 +1940,35 @@ struct Glass {
             } else {
                 return nullptr;
             }
-            light.TintLuminosityOpacity(kAcrylicLuminosity);
-            light.TintOpacity(kAcrylicTint);
+            double opacity = Translucency::Opacity();
+            light.TintLuminosityOpacity(kAcrylicLuminosity + (1.0 - kAcrylicLuminosity) * opacity);
+            light.TintOpacity(kAcrylicTint + (1.0 - kAcrylicTint) * opacity);
             return light;
         } else {
             return nullptr;
         }
     }
 
-    static typename X::Brush Replacement(typename X::Brush const& brush) {
-        if (auto solid = brush.template try_as<typename X::SolidColorBrush>())
-            return IsSolidSurface(solid.Color(), solid.Opacity()) ? ClearBrush() : nullptr;
-        return LightAcrylic(brush);
+    static typename X::Brush FadedBrush(typename X::SolidColorBrush const& solid) {
+        auto color = solid.Color();
+        if (!IsSolidSurface(color, solid.Opacity()))
+            return nullptr;
+        color.A = (BYTE)std::lround(color.A * solid.Opacity() * Translucency::Opacity());
+        return SharedBrush(color);
+    }
+
+    static bool IsApplied(Key const& key, typename X::Brush const& brush) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = entries.find(key);
+        return it != entries.end() && AbiKey(it->second.applied) == AbiKey(brush) &&
+               it->second.element.get();
+    }
+
+    static typename X::Brush Replacement(typename X::Brush const& brush, Role role) {
+        auto solid = brush.template try_as<typename X::SolidColorBrush>();
+        if (role == kBorder)
+            return solid ? RimBrush(solid) : nullptr;
+        return solid ? FadedBrush(solid) : LightAcrylic(brush);
     }
 
     static bool InSkippedAncestor(typename X::FrameworkElement const& element) {
@@ -1853,44 +1981,55 @@ struct Glass {
         return false;
     }
 
-    static void Evaluate(typename X::FrameworkElement const& element) {
-        auto dp = BackgroundProperty(element);
+    static void Evaluate(typename X::FrameworkElement const& element, Role role) {
+        auto dp = PropertyOf(element, role);
         if (!dp)
             return;
         auto brush = element.GetValue(dp).template try_as<typename X::Brush>();
-        auto replacement = brush ? Replacement(brush) : nullptr;
+        Key key{AbiKey(element), role};
+        if (!brush || IsApplied(key, brush))
+            return;
+        auto replacement = Replacement(brush, role);
         if (!replacement || InSkippedAncestor(element))
             return;
-        void* key = AbiKey(element);
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (!entries.count(key)) {
+            auto it = entries.find(key);
+            if (it == entries.end() || !it->second.element.get()) {
+                DWORD thread = GetCurrentThreadId();
+                std::erase_if(entries, [thread](auto const& item) {
+                    return item.second.thread == thread && !item.second.element.get();
+                });
                 Entry entry;
                 entry.dp = dp;
                 entry.element = winrt::make_weak(element);
                 entry.original = element.ReadLocalValue(dp);
-                entry.thread = GetCurrentThreadId();
+                entry.thread = thread;
                 entry.token = element.RegisterPropertyChangedCallback(
-                    dp, [](typename X::DependencyObject const& obj,
-                           typename X::DependencyProperty const&) {
+                    dp, [role](typename X::DependencyObject const& obj,
+                               typename X::DependencyProperty const&) {
                         if (g_unloading)
                             return;
                         try {
                             if (auto fe = obj.template try_as<typename X::FrameworkElement>())
-                                Evaluate(fe);
+                                Evaluate(fe, role);
                         } catch (...) {}
                     });
-                entries.emplace(key, entry);
+                entries.insert_or_assign(key, entry);
                 dispatchers.try_emplace(entry.thread, X::DispatcherOf(element));
             }
+            entries[key].applied = replacement;
         }
         element.SetValue(dp, replacement);
     }
 
     static void OnAdded(Inspectable const& object) {
         try {
-            if (auto element = object.try_as<typename X::FrameworkElement>())
-                Evaluate(element);
+            auto element = object.try_as<typename X::FrameworkElement>();
+            if (!element)
+                return;
+            Evaluate(element, kBackground);
+            Evaluate(element, kBorder);
         } catch (...) {}
     }
 
@@ -2048,6 +2187,9 @@ bool Init(PCWSTR processName) {
 void Shutdown() {
     if (g_treeService && g_watcher)
         g_treeService->UnadviseVisualTreeChange(g_watcher.get());
+    g_diagnostics = nullptr;
+    g_treeService = nullptr;
+    g_watcher = nullptr;
     if (g_framework == kSystem)
         Glass<SystemXaml>::RestoreAll();
     else if (g_framework == kWinUI)
@@ -4122,6 +4264,7 @@ LRESULT WINAPI DefWindowProcW_Hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         Translucency::RefreshTheme(lParam);
     } else if (msg == WM_DESTROY) {
         Genie::Forget(hwnd);
+        Translucency::Forget(hwnd);
     } else if (msg == WM_SYSCOMMAND) {
         UINT command = wParam & 0xFFF0;
         if (command == SC_MINIMIZE)
@@ -4190,9 +4333,11 @@ bool InitShell() {
     return true;
 }
 
-void Wh_ModSettingsChanged() {
-    if (g_shellActive)
+BOOL Wh_ModSettingsChanged(BOOL* bReload) {
+    *bReload = Translucency::TranslucencyChanged();
+    if (!*bReload && g_shellActive)
         TopBar::ReloadSettings();
+    return TRUE;
 }
 
 BOOL Wh_ModInit() {
