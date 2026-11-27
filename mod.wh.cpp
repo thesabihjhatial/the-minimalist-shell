@@ -72,7 +72,7 @@ using winrt::Windows::Foundation::IInspectable;
 
 constexpr int kMagnifyPercent = 150;
 constexpr double kMagnifyRange = 90.0;
-constexpr int kTopBarHeight = 48;
+constexpr int kTopBarHeight = 24;
 std::atomic<bool> g_taskbarViewDllLoaded;
 std::atomic<bool> g_unloading;
 
@@ -875,7 +875,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dw
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 namespace TopBar {
-enum Action { kNone, kNotifications, kQuickSettings, kSearch, kStart };
+enum Action { kNone, kNotifications, kQuickSettings };
 
 struct Item {
     RECT rc;
@@ -940,12 +940,6 @@ void RunAction(Action action) {
         case kQuickSettings:
             PressKeys({VK_LWIN, 'A'});
             break;
-        case kSearch:
-            PressKeys({VK_LWIN, 'S'});
-            break;
-        case kStart:
-            PressKeys({VK_LWIN});
-            break;
         default:
             break;
     }
@@ -958,6 +952,12 @@ RECT PrimaryMonitorRect() {
 }
 
 int BarHeightPx(HWND hwnd) {
+    RECT tray;
+    if (GetWindowRect(FindWindow(L"Shell_TrayWnd", nullptr), &tray)) {
+        int thickness = std::min<int>(tray.right - tray.left, tray.bottom - tray.top);
+        if (thickness > 1)
+            return thickness / 2;
+    }
     UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 96;
     if (!dpi)
         dpi = 96;
@@ -1642,25 +1642,18 @@ void Paint(HWND hwnd) {
 
         float edge = EdgePadding(s);
 
-        float startSize = 12.0f * u;
-        float startL = edge;
-        float startGap = 1.1f * u;
-        float startPane = (startSize - startGap) / 2.0f;
-
         float right = w - edge;
         float timeL = right - timeW;
         float dateR = timeL - 11.5f * u;
         float dateL = dateR - dateW;
         float clockL = dateL;
-        float ccR = clockL - 23.0f * u, ccW = 13.0f * u, ccL = ccR - ccW;
-        float seR = ccL - 25.0f * u, seW = 12.0f * u, seL = seR - seW;
         RadioIcons radios = ReadRadioIcons();
         bool airplane = radios.airplane, bluetooth = radios.bluetooth;
         bool bluetoothConnected = radios.bluetoothConnected;
         int wifiLevel = radios.wifiLevel;
         bool wired = radios.wired;
         bool showWired = radios.wired || !radios.hasWifi;
-        float cursor = seL - 21.0f * u;
+        float cursor = clockL - 23.0f * u;
         float apR = 0, apW = 12.0f * u, apL = 0;
         if (airplane) {
             apR = cursor;
@@ -1679,7 +1672,6 @@ void Paint(HWND hwnd) {
         auto addItem = [&](float l, float r, float padL, float padR, Action action) {
             items.push_back({{(LONG)(l - padL), 0, (LONG)(r + padR), h}, action});
         };
-        addItem(startL, startL + startSize, 10 * u, 12 * u, kStart);
         if (airplane)
             addItem(apL, apR, 8 * u, 11 * u, kQuickSettings);
         if (bluetooth)
@@ -1687,8 +1679,6 @@ void Paint(HWND hwnd) {
         addItem(btL, btR, 8 * u, 11 * u, kQuickSettings);
         if (!airplane)
             addItem(wfL, wfR, 11 * u, 10.5f * u, kQuickSettings);
-        addItem(seL, seR, 10.5f * u, 12.5f * u, kSearch);
-        addItem(ccL, ccR, 12.5f * u, 11.5f * u, kQuickSettings);
         addItem(clockL, right, 11.5f * u, 8 * u, kNotifications);
 
         {
@@ -1727,20 +1717,6 @@ void Paint(HWND hwnd) {
             Gdiplus::Color faint(BYTE(color.GetA() * 0.4), color.GetR(), color.GetG(),
                                  color.GetB());
             SolidBrush faintBrush(faint);
-
-            {
-                float x0 = startL;
-                float y0 = cy - startSize / 2 + dy;
-                auto pane = [&](float x, float y) {
-                    GraphicsPath pf;
-                    roundRect(pf, x, y, startPane, startPane, 1.0f * u);
-                    g.FillPath(&brush, &pf);
-                };
-                pane(x0, y0);
-                pane(x0 + startPane + startGap, y0);
-                pane(x0, y0 + startPane + startGap);
-                pane(x0 + startPane + startGap, y0 + startPane + startGap);
-            }
 
             {
                 if (g_batteryScale > 1.0001) {
@@ -1831,33 +1807,6 @@ void Paint(HWND hwnd) {
                 float r0 = 3.4f * u;
                 g.FillPie(wifiLevel >= 1 ? &brush : &faintBrush, ox - r0, oy - r0, 2 * r0,
                           2 * r0, 225.0f, 90.0f);
-            }
-
-            {
-                Pen pen(color, 1.7f * u);
-                pen.SetStartCap(LineCapRound);
-                pen.SetEndCap(LineCapRound);
-                float top = cy - 6.0f * u + dy;
-                float r = 4.3f * u;
-                float ccx = seL + r + 0.8f * u, ccy = top + r + 0.8f * u;
-                g.DrawEllipse(&pen, ccx - r, ccy - r, 2 * r, 2 * r);
-                float d = r * 0.7071f;
-                g.DrawLine(&pen, ccx + d, ccy + d, seR - 0.8f * u, top + 12.0f * u - 0.8f * u);
-            }
-
-            {
-                float pillH = 5.8f * u, gap = 1.2f * u;
-                float top = cy - (2 * pillH + gap) / 2 + dy;
-                Pen pen(color, 1.2f * u);
-                for (int i = 0; i < 2; i++) {
-                    float y = top + i * (pillH + gap);
-                    GraphicsPath pill;
-                    roundRect(pill, ccL + 0.6f * u, y + 0.6f * u, ccW - 1.2f * u,
-                              pillH - 1.2f * u, (pillH - 1.2f * u) / 2);
-                    g.DrawPath(&pen, &pill);
-                    float k = pillH - 1.0f * u;
-                    g.FillEllipse(&brush, ccL + 1.3f * u, y + 0.5f * u, k, k);
-                }
             }
 
             g.DrawString(dateText.c_str(), -1, &cf, RectF(dateL, dy, dateW + 2, (REAL)h), &fmt,
