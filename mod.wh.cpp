@@ -31,6 +31,7 @@
 #include <vssym32.h>
 #include <windowsx.h>
 #include <wlanapi.h>
+#include <xamlom.h>
 
 #include <algorithm>
 #include <array>
@@ -72,19 +73,25 @@
 
 #undef GetCurrentTime
 
+#include <winrt/Microsoft.UI.Dispatching.h>
+#include <winrt/Microsoft.UI.Xaml.Controls.h>
+#include <winrt/Microsoft.UI.Xaml.Media.h>
+#include <winrt/Microsoft.UI.Xaml.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
 #include <winrt/Windows.Devices.Enumeration.h>
 #include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Networking.Connectivity.h>
+#include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.Input.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.h>
 
 using namespace winrt::Windows::UI::Xaml;
-using winrt::Windows::Foundation::IInspectable;
+using Inspectable = winrt::Windows::Foundation::IInspectable;
 
 constexpr int kMagnifyPercent = 150;
 constexpr double kMagnifyRange = 90.0;
@@ -167,7 +174,7 @@ bool HasClass(FrameworkElement const& e, PCWSTR cls) {
     return winrt::get_class_name(e) == cls;
 }
 
-void* AbiKey(IInspectable const& obj) {
+void* AbiKey(Inspectable const& obj) {
     if (!obj)
         return nullptr;
     return winrt::get_abi(obj.as<winrt::Windows::Foundation::IUnknown>());
@@ -177,14 +184,14 @@ struct SavedProp {
     winrt::weak_ref<DependencyObject> obj;
     void* key;
     DependencyProperty dp{nullptr};
-    IInspectable value{nullptr};
+    Inspectable value{nullptr};
 };
 
 std::vector<SavedProp> g_savedProps;
 
 void SetProp(DependencyObject const& obj,
              DependencyProperty const& dp,
-             IInspectable const& value) {
+             Inspectable const& value) {
     void* key = AbiKey(obj);
     bool saved = false;
     for (auto& s : g_savedProps) {
@@ -222,8 +229,8 @@ struct DockState {
     winrt::event_token layoutToken{};
     DispatcherTimer timer{nullptr};
     DispatcherTimer motionTimer{nullptr};
-    IInspectable moveHandler{nullptr};
-    IInspectable exitHandler{nullptr};
+    Inspectable moveHandler{nullptr};
+    Inspectable exitHandler{nullptr};
     DWORD lastTrayLookup = 0;
     DWORD lastStartLookup = 0;
     ULONGLONG lastMotionTick = 0;
@@ -483,7 +490,7 @@ void AttachMagnify(std::shared_ptr<DockState> state) {
     std::weak_ptr<DockState> weakState = state;
 
     state->moveHandler = winrt::box_value(Input::PointerEventHandler(
-        [weakRepeater, weakState](IInspectable const&, Input::PointerRoutedEventArgs const& args) {
+        [weakRepeater, weakState](Inspectable const&, Input::PointerRoutedEventArgs const& args) {
             if (g_unloading)
                 return;
             auto rep = weakRepeater.get();
@@ -501,7 +508,7 @@ void AttachMagnify(std::shared_ptr<DockState> state) {
         }));
 
     state->exitHandler = winrt::box_value(Input::PointerEventHandler(
-        [weakRepeater, weakState](IInspectable const&, Input::PointerRoutedEventArgs const& args) {
+        [weakRepeater, weakState](Inspectable const&, Input::PointerRoutedEventArgs const& args) {
             if (g_unloading)
                 return;
             auto rep = weakRepeater.get();
@@ -604,16 +611,16 @@ void ApplyToFrame(FrameworkElement const& frame) {
 
     std::weak_ptr<DockState> weak = st;
     st->layoutToken = repeater.LayoutUpdated(
-        [weak](IInspectable const&, IInspectable const&) { OnLayoutUpdated(weak); });
+        [weak](Inspectable const&, Inspectable const&) { OnLayoutUpdated(weak); });
 
     st->motionTimer = DispatcherTimer();
     st->motionTimer.Interval(std::chrono::milliseconds(Motion::kFrameMs));
     st->motionTimer.Tick(
-        [weak](IInspectable const&, IInspectable const&) { MotionTick(weak); });
+        [weak](Inspectable const&, Inspectable const&) { MotionTick(weak); });
 
     st->timer = DispatcherTimer();
     st->timer.Interval(std::chrono::milliseconds(1000));
-    st->timer.Tick([weak](IInspectable const&, IInspectable const&) { OnLayoutUpdated(weak); });
+    st->timer.Tick([weak](Inspectable const&, Inspectable const&) { OnLayoutUpdated(weak); });
     st->timer.Start();
 
     g_states.push_back(st);
@@ -876,6 +883,10 @@ HMODULE GetTaskbarViewModuleHandle() {
     return m ? m : GetModuleHandle(L"ExplorerExtensions.dll");
 }
 
+namespace XamlGlass {
+void OnModuleLoaded(HMODULE module);
+}
+
 using LoadLibraryExW_t = decltype(&LoadLibraryExW);
 LoadLibraryExW_t LoadLibraryExW_Original;
 HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
@@ -885,6 +896,8 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dw
         if (HookTaskbarViewDllSymbols(module))
             Wh_ApplyHookOperations();
     }
+    if (module)
+        XamlGlass::OnModuleLoaded(module);
     return module;
 }
 
@@ -1165,7 +1178,7 @@ bool IsClearPart(std::wstring const& theme, int part, int state) {
                part == AW_COMMANDAREA;
     if (theme == L"CommandModule")
         return part == 1 && state == 0;
-    if (theme == L"CommonItemsDialog" || theme == L"PreviewPane")
+    if (theme == L"CommonItemsDialog")
         return part == 1;
     if (theme == L"ControlPanel")
         return part == CPANEL_CONTENTPANE || part == CPANEL_CONTENTPANELINE ||
@@ -1175,8 +1188,14 @@ bool IsClearPart(std::wstring const& theme, int part, int state) {
         return part == 0 || (part == HP_HEADERITEM && (state == HIS_NORMAL ||
                                                        state == HIS_SORTEDNORMAL ||
                                                        state == HIS_ICONNORMAL));
+    if (theme == L"PreviewPane")
+        return part == 1 || part == 3 || part == 4;
     if (theme == L"Rebar")
         return (part == RP_BAND || part == RP_BACKGROUND) && state == 0;
+    if (theme == L"ScrollBar")
+        return part == SBP_ARROWBTN || part == SBP_GRIPPERHORZ || part == SBP_GRIPPERVERT ||
+               part == SBP_LOWERTRACKHORZ || part == SBP_LOWERTRACKVERT || part == SBP_SIZEBOX ||
+               part == SBP_UPPERTRACKHORZ || part == SBP_UPPERTRACKVERT;
     if (theme == L"Status")
         return part == 0;
     if (theme == L"Tab")
@@ -1334,28 +1353,141 @@ HRESULT WINAPI DrawTextWithGlow_Hook(HDC hdc, LPWSTR text, UINT count, RECT* rec
     return DrawTextW(hdc, text, count, rect, flags & ~DT_MODIFYSTRING) ? S_OK : E_FAIL;
 }
 
+BYTE HighlightAlpha(std::wstring const& theme, int part, int state) {
+    if (!g_explorer || theme != L"TreeView" || part != TVP_TREEITEM)
+        return 0;
+    switch (state) {
+        case TREIS_HOT:
+            return 0x14;
+        case TREIS_HOTSELECTED:
+            return 0x30;
+        case TREIS_SELECTED:
+            return 0x26;
+        case TREIS_SELECTEDNOTFOCUS:
+            return 0x1C;
+    }
+    return 0;
+}
+
+float DcScale(HDC hdc) {
+    HWND hwnd = WindowFromDC(hdc);
+    UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 0;
+    return (dpi ? dpi : 96) / 96.0f;
+}
+
+BYTE ThumbAlpha(int state) {
+    switch (state) {
+        case SCRBS_HOT:
+            return 0x90;
+        case SCRBS_HOVER:
+            return 0x70;
+        case SCRBS_NORMAL:
+            return 0x60;
+        case SCRBS_PRESSED:
+            return 0xB0;
+    }
+    return 0;
+}
+
+void PaintRounded(HDC hdc, RECT const& shape, RECT const& clip, BYTE alpha, float radius) {
+    RECT area;
+    if (!IntersectRect(&area, &shape, &clip))
+        return;
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    BP_PAINTPARAMS params{sizeof(params), BPPF_ERASE | BPPF_NOCLIP, nullptr, &blend};
+    HDC memDC = nullptr;
+    HPAINTBUFFER buffer = BeginBufferedPaint(hdc, &area, BPBF_TOPDOWNDIB, &params, &memDC);
+    if (!buffer)
+        return;
+    RGBQUAD* pixels = nullptr;
+    int stride = 0;
+    if (FAILED(GetBufferedPaintBits(buffer, &pixels, &stride))) {
+        EndBufferedPaint(buffer, FALSE);
+        return;
+    }
+    float w = (float)(shape.right - shape.left), h = (float)(shape.bottom - shape.top);
+    radius = std::min({radius, w / 2, h / 2});
+    BYTE tone = g_dark ? 255 : 0;
+    for (int y = 0; y < area.bottom - area.top; y++) {
+        RGBQUAD* row = pixels + y * stride;
+        float py = y + area.top - shape.top + 0.5f;
+        for (int x = 0; x < area.right - area.left; x++) {
+            float px = x + area.left - shape.left + 0.5f;
+            float dx = px - std::clamp(px, radius, w - radius);
+            float dy = py - std::clamp(py, radius, h - radius);
+            float coverage = std::clamp(radius + 0.5f - std::sqrt(dx * dx + dy * dy), 0.0f, 1.0f);
+            BYTE a = (BYTE)(alpha * coverage + 0.5f);
+            BYTE c = (BYTE)(tone * a / 255);
+            row[x] = {c, c, c, a};
+        }
+    }
+    EndBufferedPaint(buffer, TRUE);
+}
+
+void PaintThumb(HDC hdc, int part, int state, RECT const& shape, RECT const& area) {
+    FillRect(hdc, &area, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    BYTE alpha = ThumbAlpha(state);
+    if (!alpha)
+        return;
+    float scale = DcScale(hdc);
+    bool wide = state == SCRBS_HOT || state == SCRBS_PRESSED;
+    LONG thickness = std::lround((wide ? 8.0f : 6.0f) * scale);
+    LONG inset = std::lround(2.0f * scale);
+    RECT pill = shape;
+    if (part == SBP_THUMBBTNVERT) {
+        pill.left = (shape.left + shape.right - thickness) / 2;
+        pill.right = pill.left + thickness;
+        InflateRect(&pill, 0, -inset);
+    } else {
+        pill.top = (shape.top + shape.bottom - thickness) / 2;
+        pill.bottom = pill.top + thickness;
+        InflateRect(&pill, -inset, 0);
+    }
+    PaintRounded(hdc, pill, area, alpha, thickness / 2.0f);
+}
+
+bool PaintGlassPart(HTHEME theme, HDC hdc, int part, int state, RECT const& shape,
+                    RECT const& area) {
+    if (g_unloading)
+        return false;
+    std::wstring name = ThemeClass(theme);
+    if (BYTE alpha = HighlightAlpha(name, part, state)) {
+        PaintRounded(hdc, shape, area, alpha, 4.0f * DcScale(hdc));
+        return true;
+    }
+    if (g_explorer && name == L"ScrollBar" &&
+        (part == SBP_THUMBBTNHORZ || part == SBP_THUMBBTNVERT)) {
+        PaintThumb(hdc, part, state, shape, area);
+        return true;
+    }
+    if (!IsClearPart(name, part, state))
+        return false;
+    if (HWND hwnd = WindowFromDC(hdc); hwnd && IsSurface(hwnd))
+        ApplySurface(hwnd);
+    FillRect(hdc, &area, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    return true;
+}
+
 HRESULT WINAPI DrawThemeBackground_Hook(HTHEME theme, HDC hdc, int part, int state,
                                         LPCRECT rect, LPCRECT clip) {
-    if (!g_unloading && rect && IsClearPart(ThemeClass(theme), part, state)) {
+    if (rect) {
         RECT area = *rect;
         if (clip)
             IntersectRect(&area, rect, clip);
-        if (HWND hwnd = WindowFromDC(hdc); hwnd && IsSurface(hwnd))
-            ApplySurface(hwnd);
-        FillRect(hdc, &area, (HBRUSH)GetStockObject(BLACK_BRUSH));
-        return S_OK;
+        if (PaintGlassPart(theme, hdc, part, state, *rect, area))
+            return S_OK;
     }
     return DrawThemeBackground_Original(theme, hdc, part, state, rect, clip);
 }
 
 HRESULT WINAPI DrawThemeBackgroundEx_Hook(HTHEME theme, HDC hdc, int part, int state,
                                           LPCRECT rect, DTBGOPTS const* options) {
-    if (!g_unloading && rect && IsClearPart(ThemeClass(theme), part, state)) {
+    if (rect) {
         RECT area = *rect;
         if (options && (options->dwFlags & DTBG_CLIPRECT))
             IntersectRect(&area, rect, &options->rcClip);
-        FillRect(hdc, &area, (HBRUSH)GetStockObject(BLACK_BRUSH));
-        return S_OK;
+        if (PaintGlassPart(theme, hdc, part, state, *rect, area))
+            return S_OK;
     }
     return DrawThemeBackgroundEx_Original(theme, hdc, part, state, rect, options);
 }
@@ -1553,6 +1685,382 @@ void Uninstall() {
     std::lock_guard<std::mutex> lock(g_savedMutex);
     g_saved.clear();
 }
+}
+
+namespace XamlGlass {
+enum Framework { kNone, kSystem, kWinUI };
+
+constexpr double kAcrylicLuminosity = 0.35;
+constexpr double kAcrylicTint = 0.25;
+constexpr BYTE kOpaqueAlpha = 0xB0;
+constexpr int kNeutralSpread = 12;
+constexpr CLSID kWatcherClsid = {
+    0x8f3b1c2a, 0x6d4e, 0x4b7a, {0x9e, 0x51, 0x2c, 0x7d, 0x3a, 0x60, 0xf4, 0x18}};
+
+winrt::com_ptr<IXamlDiagnostics> g_diagnostics;
+Framework g_framework = kNone;
+std::atomic<bool> g_injected{false};
+winrt::com_ptr<IVisualTreeService3> g_treeService;
+winrt::com_ptr<IVisualTreeServiceCallback2> g_watcher;
+
+bool IsSkippedAncestor(std::wstring_view name) {
+    for (PCWSTR part : {L"Flyout", L"Popup", L"TabViewItem", L"ToolTip"}) {
+        if (ContainsNoCase(name, part))
+            return true;
+    }
+    return false;
+}
+
+bool IsSolidSurface(winrt::Windows::UI::Color color, double opacity) {
+    int spread = std::max({color.R, color.G, color.B}) - std::min({color.R, color.G, color.B});
+    return color.A * opacity >= kOpaqueAlpha && spread <= kNeutralSpread;
+}
+
+struct SystemXaml {
+    using AcrylicBrush = winrt::Windows::UI::Xaml::Media::AcrylicBrush;
+    using Border = winrt::Windows::UI::Xaml::Controls::Border;
+    using Brush = winrt::Windows::UI::Xaml::Media::Brush;
+    using CompositionBrush = winrt::Windows::UI::Xaml::Media::XamlCompositionBrushBase;
+    using ContentPresenter = winrt::Windows::UI::Xaml::Controls::ContentPresenter;
+    using Control = winrt::Windows::UI::Xaml::Controls::Control;
+    using DependencyObject = winrt::Windows::UI::Xaml::DependencyObject;
+    using DependencyProperty = winrt::Windows::UI::Xaml::DependencyProperty;
+    using Dispatcher = winrt::Windows::UI::Core::CoreDispatcher;
+    using FrameworkElement = winrt::Windows::UI::Xaml::FrameworkElement;
+    using Panel = winrt::Windows::UI::Xaml::Controls::Panel;
+    using SolidColorBrush = winrt::Windows::UI::Xaml::Media::SolidColorBrush;
+    using VisualTreeHelper = winrt::Windows::UI::Xaml::Media::VisualTreeHelper;
+    static constexpr bool kAcrylic = true;
+
+    static Dispatcher DispatcherOf(DependencyObject const& obj) {
+        return obj.Dispatcher();
+    }
+
+    template <typename F>
+    static void Run(Dispatcher const& dispatcher, F fn) {
+        auto op = dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                                      [fn] { fn(); });
+        op.wait_for(std::chrono::seconds(2));
+    }
+};
+
+struct WinUIXaml {
+    using AcrylicBrush = winrt::Microsoft::UI::Xaml::Media::AcrylicBrush;
+    using Border = winrt::Microsoft::UI::Xaml::Controls::Border;
+    using Brush = winrt::Microsoft::UI::Xaml::Media::Brush;
+    using CompositionBrush = winrt::Microsoft::UI::Xaml::Media::XamlCompositionBrushBase;
+    using ContentPresenter = winrt::Microsoft::UI::Xaml::Controls::ContentPresenter;
+    using Control = winrt::Microsoft::UI::Xaml::Controls::Control;
+    using DependencyObject = winrt::Microsoft::UI::Xaml::DependencyObject;
+    using DependencyProperty = winrt::Microsoft::UI::Xaml::DependencyProperty;
+    using Dispatcher = winrt::Microsoft::UI::Dispatching::DispatcherQueue;
+    using FrameworkElement = winrt::Microsoft::UI::Xaml::FrameworkElement;
+    using Panel = winrt::Microsoft::UI::Xaml::Controls::Panel;
+    using SolidColorBrush = winrt::Microsoft::UI::Xaml::Media::SolidColorBrush;
+    using VisualTreeHelper = winrt::Microsoft::UI::Xaml::Media::VisualTreeHelper;
+    static constexpr bool kAcrylic = false;
+
+    static Dispatcher DispatcherOf(DependencyObject const& obj) {
+        return obj.DispatcherQueue();
+    }
+
+    template <typename F>
+    static void Run(Dispatcher const& dispatcher, F fn) {
+        auto done = std::make_shared<winrt::handle>(CreateEvent(nullptr, TRUE, FALSE, nullptr));
+        if (dispatcher.TryEnqueue([fn, done] {
+                fn();
+                SetEvent(done->get());
+            }))
+            WaitForSingleObject(done->get(), 2000);
+    }
+};
+
+template <typename X>
+struct Glass {
+    struct Entry {
+        typename X::DependencyProperty dp{nullptr};
+        winrt::weak_ref<typename X::FrameworkElement> element;
+        Inspectable original{nullptr};
+        DWORD thread = 0;
+        int64_t token = 0;
+    };
+
+    static inline std::unordered_map<DWORD, typename X::Dispatcher> dispatchers;
+    static inline std::unordered_map<void*, Entry> entries;
+    static inline std::mutex mutex;
+
+    static typename X::DependencyProperty BackgroundProperty(
+        typename X::FrameworkElement const& element) {
+        if (element.template try_as<typename X::Panel>())
+            return X::Panel::BackgroundProperty();
+        if (element.template try_as<typename X::Border>())
+            return X::Border::BackgroundProperty();
+        if (element.template try_as<typename X::Control>())
+            return X::Control::BackgroundProperty();
+        if (element.template try_as<typename X::ContentPresenter>())
+            return X::ContentPresenter::BackgroundProperty();
+        return nullptr;
+    }
+
+    static typename X::Brush ClearBrush() {
+        static thread_local typename X::SolidColorBrush clear{nullptr};
+        if (!clear)
+            clear = typename X::SolidColorBrush(winrt::Windows::UI::Color{0, 0, 0, 0});
+        return clear;
+    }
+
+    static typename X::Brush LightAcrylic(typename X::Brush const& brush) {
+        if constexpr (X::kAcrylic) {
+            if (!ContainsNoCase(winrt::get_class_name(brush), L"AcrylicBrush"))
+                return nullptr;
+            typename X::AcrylicBrush light;
+            if (auto acrylic = brush.template try_as<typename X::AcrylicBrush>()) {
+                auto luminosity = acrylic.TintLuminosityOpacity();
+                if (luminosity && luminosity.Value() == kAcrylicLuminosity)
+                    return nullptr;
+                light.BackgroundSource(acrylic.BackgroundSource());
+                light.FallbackColor(acrylic.FallbackColor());
+                light.TintColor(acrylic.TintColor());
+            } else if (auto composition = brush.template try_as<typename X::CompositionBrush>()) {
+                light.BackgroundSource(
+                    winrt::Windows::UI::Xaml::Media::AcrylicBackgroundSource::HostBackdrop);
+                light.FallbackColor(composition.FallbackColor());
+                light.TintColor(composition.FallbackColor());
+            } else {
+                return nullptr;
+            }
+            light.TintLuminosityOpacity(kAcrylicLuminosity);
+            light.TintOpacity(kAcrylicTint);
+            return light;
+        } else {
+            return nullptr;
+        }
+    }
+
+    static typename X::Brush Replacement(typename X::Brush const& brush) {
+        if (auto solid = brush.template try_as<typename X::SolidColorBrush>())
+            return IsSolidSurface(solid.Color(), solid.Opacity()) ? ClearBrush() : nullptr;
+        return LightAcrylic(brush);
+    }
+
+    static bool InSkippedAncestor(typename X::FrameworkElement const& element) {
+        typename X::DependencyObject current = element;
+        for (int depth = 0; current && depth < 64; depth++) {
+            if (IsSkippedAncestor(winrt::get_class_name(current)))
+                return true;
+            current = X::VisualTreeHelper::GetParent(current);
+        }
+        return false;
+    }
+
+    static void Evaluate(typename X::FrameworkElement const& element) {
+        auto dp = BackgroundProperty(element);
+        if (!dp)
+            return;
+        auto brush = element.GetValue(dp).template try_as<typename X::Brush>();
+        auto replacement = brush ? Replacement(brush) : nullptr;
+        if (!replacement || InSkippedAncestor(element))
+            return;
+        void* key = AbiKey(element);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!entries.count(key)) {
+                Entry entry;
+                entry.dp = dp;
+                entry.element = winrt::make_weak(element);
+                entry.original = element.ReadLocalValue(dp);
+                entry.thread = GetCurrentThreadId();
+                entry.token = element.RegisterPropertyChangedCallback(
+                    dp, [](typename X::DependencyObject const& obj,
+                           typename X::DependencyProperty const&) {
+                        if (g_unloading)
+                            return;
+                        try {
+                            if (auto fe = obj.template try_as<typename X::FrameworkElement>())
+                                Evaluate(fe);
+                        } catch (...) {}
+                    });
+                entries.emplace(key, entry);
+                dispatchers.try_emplace(entry.thread, X::DispatcherOf(element));
+            }
+        }
+        element.SetValue(dp, replacement);
+    }
+
+    static void OnAdded(Inspectable const& object) {
+        try {
+            if (auto element = object.try_as<typename X::FrameworkElement>())
+                Evaluate(element);
+        } catch (...) {}
+    }
+
+    static void RestoreThread() {
+        std::vector<Entry> mine;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto it = entries.begin(); it != entries.end();) {
+                if (it->second.thread != GetCurrentThreadId()) {
+                    ++it;
+                    continue;
+                }
+                mine.push_back(it->second);
+                it = entries.erase(it);
+            }
+        }
+        for (auto const& entry : mine) {
+            try {
+                auto element = entry.element.get();
+                if (!element)
+                    continue;
+                element.UnregisterPropertyChangedCallback(entry.dp, entry.token);
+                if (entry.original == X::DependencyProperty::UnsetValue())
+                    element.ClearValue(entry.dp);
+                else
+                    element.SetValue(entry.dp, entry.original);
+            } catch (...) {}
+        }
+    }
+
+    static void RestoreAll() {
+        std::unordered_map<DWORD, typename X::Dispatcher> targets;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            targets.swap(dispatchers);
+        }
+        for (auto const& [thread, dispatcher] : targets) {
+            try {
+                X::Run(dispatcher, [] { RestoreThread(); });
+            } catch (...) {}
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        entries.clear();
+    }
+};
+
+struct Watcher : winrt::implements<Watcher, IObjectWithSite, IVisualTreeServiceCallback2> {
+    HRESULT STDMETHODCALLTYPE GetSite(REFIID riid, void** site) override {
+        return g_diagnostics ? g_diagnostics->QueryInterface(riid, site) : E_FAIL;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnElementStateChanged(InstanceHandle, VisualElementState,
+                                                    LPCWSTR) override {
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnVisualTreeChange(ParentChildRelation, VisualElement element,
+                                                 VisualMutationType mutation) override {
+        if (mutation != Add || g_unloading || !g_diagnostics)
+            return S_OK;
+        Inspectable object;
+        if (FAILED(g_diagnostics->GetIInspectableFromHandle(
+                element.Handle, reinterpret_cast<::IInspectable**>(winrt::put_abi(object)))))
+            return S_OK;
+        if (g_framework == kSystem)
+            Glass<SystemXaml>::OnAdded(object);
+        else if (g_framework == kWinUI)
+            Glass<WinUIXaml>::OnAdded(object);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetSite(IUnknown* site) override {
+        g_diagnostics = nullptr;
+        g_treeService = nullptr;
+        if (!site)
+            return S_OK;
+        if (FAILED(site->QueryInterface(IID_PPV_ARGS(g_diagnostics.put()))) ||
+            FAILED(site->QueryInterface(IID_PPV_ARGS(g_treeService.put()))))
+            return E_FAIL;
+        g_watcher.copy_from(static_cast<IVisualTreeServiceCallback2*>(this));
+        HANDLE thread = CreateThread(
+            nullptr, 0,
+            [](void*) -> DWORD {
+                if (g_treeService && g_watcher)
+                    g_treeService->AdviseVisualTreeChange(g_watcher.get());
+                return 0;
+            },
+            nullptr, 0, nullptr);
+        if (thread)
+            CloseHandle(thread);
+        return S_OK;
+    }
+};
+
+struct Factory : winrt::implements<Factory, IClassFactory> {
+    HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown* outer, REFIID riid,
+                                             void** object) override {
+        *object = nullptr;
+        if (outer)
+            return CLASS_E_NOAGGREGATION;
+        return winrt::make<Watcher>().as<IUnknown>()->QueryInterface(riid, object);
+    }
+
+    HRESULT STDMETHODCALLTYPE LockServer(BOOL) override {
+        return S_OK;
+    }
+};
+
+PCWSTR EntryModule() {
+    return g_framework == kSystem ? L"Windows.UI.Xaml.dll" : L"Microsoft.Internal.FrameworkUdk.dll";
+}
+
+void Inject() {
+    using Initialize_t = HRESULT(WINAPI*)(PCWSTR, DWORD, PCWSTR, PCWSTR, CLSID, PCWSTR);
+    HMODULE entry = g_framework == kNone ? nullptr : GetModuleHandle(EntryModule());
+    auto initialize =
+        entry ? (Initialize_t)GetProcAddress(entry, "InitializeXamlDiagnosticsEx") : nullptr;
+    if (!initialize || g_injected.exchange(true))
+        return;
+    WCHAR path[MAX_PATH];
+    PCWSTR prefix = g_framework == kSystem ? L"VisualDiagConnection" : L"WinUIVisualDiagConnection";
+    if (GetModuleFileName((HMODULE)&__ImageBase, path, ARRAYSIZE(path))) {
+        for (int i = 1; i <= 32; i++) {
+            WCHAR connection[64];
+            wsprintf(connection, L"%s%d", prefix, i);
+            if (SUCCEEDED(initialize(connection, GetCurrentProcessId(), L"", path,
+                                     kWatcherClsid, nullptr)))
+                return;
+        }
+    }
+    g_injected = false;
+}
+
+void OnModuleLoaded(HMODULE module) {
+    WCHAR path[MAX_PATH];
+    if (g_framework == kNone || g_injected || !GetModuleFileName(module, path, ARRAYSIZE(path)))
+        return;
+    PCWSTR name = BaseName(path);
+    if (_wcsicmp(name, EntryModule()) == 0 ||
+        (g_framework == kWinUI && _wcsicmp(name, L"Microsoft.UI.Xaml.dll") == 0))
+        Inject();
+}
+
+bool Init(PCWSTR processName) {
+    if (_wcsicmp(processName, L"explorer.exe") == 0)
+        g_framework = kWinUI;
+    else if (_wcsicmp(processName, L"SearchHost.exe") == 0 ||
+             _wcsicmp(processName, L"ShellExperienceHost.exe") == 0 ||
+             _wcsicmp(processName, L"ShellHost.exe") == 0 ||
+             _wcsicmp(processName, L"StartMenuExperienceHost.exe") == 0)
+        g_framework = kSystem;
+    return g_framework != kNone;
+}
+
+void Shutdown() {
+    if (g_treeService && g_watcher)
+        g_treeService->UnadviseVisualTreeChange(g_watcher.get());
+    if (g_framework == kSystem)
+        Glass<SystemXaml>::RestoreAll();
+    else if (g_framework == kWinUI)
+        Glass<WinUIXaml>::RestoreAll();
+}
+}
+
+extern "C" __declspec(dllexport) HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID clsid,
+                                                                         REFIID riid,
+                                                                         LPVOID* object) {
+    if (clsid != XamlGlass::kWatcherClsid)
+        return CLASS_E_CLASSNOTAVAILABLE;
+    return winrt::make<XamlGlass::Factory>().as<IUnknown>()->QueryInterface(riid, object);
 }
 
 namespace TopBar {
@@ -1862,7 +2370,7 @@ DWORD WINAPI RadioThreadProc(void*) {
     bool networkWatched = false;
     try {
         networkToken = Connectivity::NetworkInformation::NetworkStatusChanged(
-            [](IInspectable const&) { SetEvent(g_radioChangeEvent); });
+            [](Inspectable const&) { SetEvent(g_radioChangeEvent); });
         networkWatched = true;
     } catch (...) {}
 
@@ -1886,7 +2394,7 @@ DWORD WINAPI RadioThreadProc(void*) {
                             snap.bluetoothOn = true;
                     }
                     subscriptions.emplace_back(
-                        radio, radio.StateChanged([](Radios::Radio const&, IInspectable const&) {
+                        radio, radio.StateChanged([](Radios::Radio const&, Inspectable const&) {
                             SetEvent(g_radioChangeEvent);
                         }));
                 }
@@ -3663,11 +4171,12 @@ void HookGenie() {
 
 bool g_shellActive = false;
 
-bool IsExplorerProcess() {
-    WCHAR path[MAX_PATH];
-    if (!GetModuleFileName(nullptr, path, ARRAYSIZE(path)))
-        return false;
-    return _wcsicmp(BaseName(path), L"explorer.exe") == 0;
+void HookLoadLibrary() {
+    HMODULE kernelBase = GetModuleHandle(L"kernelbase.dll");
+    auto loadLibrary =
+        kernelBase ? (LoadLibraryExW_t)GetProcAddress(kernelBase, "LoadLibraryExW") : nullptr;
+    if (loadLibrary)
+        WindhawkUtils::SetFunctionHook(loadLibrary, LoadLibraryExW_Hook, &LoadLibraryExW_Original);
 }
 
 bool InitShell() {
@@ -3677,13 +4186,6 @@ bool InitShell() {
     if (HMODULE m = GetTaskbarViewModuleHandle()) {
         g_taskbarViewDllLoaded = true;
         HookTaskbarViewDllSymbols(m);
-    } else {
-        HMODULE kb = GetModuleHandle(L"kernelbase.dll");
-        auto pLoadLibraryExW =
-            kb ? (LoadLibraryExW_t)GetProcAddress(kb, "LoadLibraryExW") : nullptr;
-        if (pLoadLibraryExW)
-            WindhawkUtils::SetFunctionHook(pLoadLibraryExW, LoadLibraryExW_Hook,
-                                           &LoadLibraryExW_Original);
     }
     return true;
 }
@@ -3694,9 +4196,16 @@ void Wh_ModSettingsChanged() {
 }
 
 BOOL Wh_ModInit() {
+    WCHAR path[MAX_PATH]{};
+    GetModuleFileName(nullptr, path, ARRAYSIZE(path));
+    PCWSTR name = BaseName(path);
+    bool explorer = _wcsicmp(name, L"explorer.exe") == 0;
     HookGenie();
-    Translucency::Install(IsExplorerProcess());
-    g_shellActive = IsExplorerProcess() && InitShell();
+    Translucency::Install(explorer);
+    bool watchXaml = XamlGlass::Init(name);
+    g_shellActive = explorer && InitShell();
+    if (watchXaml || (g_shellActive && !g_taskbarViewDllLoaded))
+        HookLoadLibrary();
     if (g_shellActive)
         TopBar::ReloadSettings();
     return TRUE;
@@ -3704,6 +4213,7 @@ BOOL Wh_ModInit() {
 
 void Wh_ModAfterInit() {
     Translucency::ApplyExisting();
+    XamlGlass::Inject();
     if (!g_shellActive)
         return;
     if (!g_taskbarViewDllLoaded) {
@@ -3722,6 +4232,7 @@ void Wh_ModAfterInit() {
 
 void Wh_ModBeforeUninit() {
     Genie::BeginUnload();
+    XamlGlass::Shutdown();
     if (!g_shellActive)
         return;
     TopBar::Stop();
